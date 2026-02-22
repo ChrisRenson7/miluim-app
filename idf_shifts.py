@@ -196,9 +196,10 @@ def get_shift_warnings(db_session, target_date, days_to_add=1):
     end_dt = start_dt + timedelta(days=days_to_add) 
     shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).all()
     
-    # הבאת היסטוריה של 24 שעות אחורה לטובת חישובי מנוחה מדויקים של המחליפים!
+    # הבאת היסטוריה ועתיד כדי להמליץ נכון על מחליפים!
     history_dt = start_dt - timedelta(hours=24)
-    all_recent_shifts = db_session.query(Shift).filter(Shift.start_time >= history_dt, Shift.start_time < end_dt).all()
+    lookahead_dt = end_dt + timedelta(hours=24)
+    all_recent_shifts = db_session.query(Shift).filter(Shift.start_time >= history_dt, Shift.start_time < lookahead_dt).all()
     
     warnings = {}
     posts_cache = {p.id: p for p in db_session.query(Post).all()}
@@ -238,40 +239,44 @@ def get_shift_warnings(db_session, target_date, days_to_add=1):
                     s_time = prev_s.start_time.strftime('%H:%M')
                     e_time = prev_s.end_time.strftime('%H:%M')
                     
-                    # --- מנוע מציאת המחליף האידיאלי ---
+                    # --- מנוע מציאת המחליף האידיאלי (עם ראיית עתיד) ---
                     best_rep = None
                     max_rep_rest = -1
                     
                     for rep_u in users_cache.values():
                         rep_uid_str = str(rep_u.id)
-                        if rep_uid_str in assigned_ids_str: continue # כבר שומר במשמרת הזו
+                        if rep_uid_str in assigned_ids_str: continue 
                         
-                        # סינון חסימות עמדה לחייל האופציונלי
                         if any(pc.user_id == rep_u.id and pc.post_id == s.post_id for pc in pcs_cache): continue
-                        # סינון אילוצי זמינות
                         if any(c.user_id == rep_u.id and c.start_time < s.end_time and c.end_time > s.start_time for c in constraints_cache): continue
                         
-                        # בדיקה שהמחליף לא שומר כרגע במשמרת מקבילה בעמדה אחרת
                         overlaps = any(str(rep_u.id) in (os.assigned_user_ids or "").split(",") and max(s.start_time, os.start_time) < min(s.end_time, os.end_time) for os in all_recent_shifts if os.id != s.id)
                         if overlaps: continue
                         
-                        # חישוב המנוחה של המחליף הפוטנציאלי
                         rep_prev_shifts = [os for os in all_recent_shifts if rep_uid_str in (os.assigned_user_ids or "").split(",") and os.end_time <= s.start_time]
                         rep_last = max(rep_prev_shifts, key=lambda x: x.end_time, default=None)
                         rep_rest = (s.start_time - rep_last.end_time).total_seconds() / 3600.0 if rep_last else 999
                         
-                        if rep_rest > max_rep_rest:
-                            max_rep_rest = rep_rest
-                            best_rep = rep_u
-                            
-                    rec_str = ""
+                        # בדיקת עתיד: מוודאים שמשמרת ההחלפה לא דופקת לו את המשמרת הבאה
+                        rep_next_shifts = [os for os in all_recent_shifts if rep_uid_str in (os.assigned_user_ids or "").split(",") and os.start_time >= s.end_time]
+                        rep_next = min(rep_next_shifts, key=lambda x: x.start_time, default=None)
+                        future_rest = (rep_next.start_time - s.end_time).total_seconds() / 3600.0 if rep_next else 999
+                        
+                        # ממליצים רק אם למחליף יש מספיק מנוחה גם לפני וגם אחרי המשמרת!
+                        if rep_rest >= MIN_REST_HOURS and future_rest >= MIN_REST_HOURS:
+                            if rep_rest > max_rep_rest:
+                                max_rep_rest = rep_rest
+                                best_rep = rep_u
+                                
                     if best_rep:
                         rest_text = f"{max_rep_rest:.1f} ש'" if max_rep_rest != 999 else "יותר מ-24 ש'"
                         rec_str = f" [💡 מומלץ להחליף עם: {best_rep.name} (נח {rest_text})]"
+                        # יש מחליף -> טעות אנוש (לא מופיע "אילוץ")
+                        warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש'.{rec_str}"
                     else:
                         rec_str = " [⚠️ אין אף מחליף פנוי]"
-                        
-                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ).{rec_str}"
+                        # אין מחליף -> אילוץ מערכת
+                        warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ).{rec_str}"
     return warnings
 
 def auto_assign_shifts(db_session, target_date, days_to_add=1):
@@ -368,6 +373,7 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 shift.assigned_user_ids = ",".join(assigned_list)
     db_session.commit()
 
+# דגל למנגנון הריענון החי
 def flag_save():
     st.session_state.save_clicked = True
 
@@ -377,6 +383,11 @@ def flag_save():
 def render_dashboard_tab(db_session):
     st.header("לוח שיבוצים מרכזי 🛡️")
     
+    # הצגת הודעת הצלחה לאחר ריענון הדף (כדי שהטבלה למטה תהיה מעודכנת באמת)
+    if st.session_state.get("show_success"):
+        st.success("השינויים הידניים נשמרו בהצלחה והלוח רוענן! 💾")
+        st.session_state.show_success = False
+
     tools_container = st.container()
     with tools_container:
         col_date, col_auto, col_clear, col_save = st.columns([1.5, 1.2, 1, 1])
@@ -470,10 +481,12 @@ def render_dashboard_tab(db_session):
         st.markdown('<div class="alert-box"><strong>🚨 חריגות בלוח:</strong><br/>' + 
                     "<br/>".join([f"• {v}" for v in warnings_dict.values()]) + '</div>', unsafe_allow_html=True)
 
+    # מנגנון שמירה חי - דוחף למסד נתונים ועושה Rerun שקוף למסך
     if st.session_state.get("save_clicked"):
         db_session.commit()
         st.session_state.save_clicked = False
-        st.success("השינויים הידניים נשמרו בהצלחה!")
+        st.session_state.show_success = True
+        st.rerun()
 
 # ==========================================
 # 3.5. טאב תצוגה לצילום מסך (View Only)
