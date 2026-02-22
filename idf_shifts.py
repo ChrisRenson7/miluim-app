@@ -607,10 +607,15 @@ def render_personnel_tab(db_session):
         row["למחיקה"] = False
         summary.append(row)
     
-    if summary:
+if summary:
         st.subheader("📊 מפת חלוקת נטל (אינטראקטיבי)")
         df_chart = pd.DataFrame(summary)
-        st.bar_chart(df_chart.set_index("שם")["סה\"כ שעות"], color="#059669")
+        
+        # בדיקה אם יש בכלל שעות להציג
+        if df_chart["סה\"כ שעות"].sum() > 0:
+            st.bar_chart(df_chart.set_index("שם")["סה\"כ שעות"], color="#059669")
+        else:
+            st.info("הגרף יוצג כאן ברגע שישובצו שעות לחיילים (כרגע כולם על 0).")
         
         st.subheader("📋 ניהול סד\"כ קבוע")
         df_sum = pd.DataFrame(summary)
@@ -860,3 +865,4 @@ def main():
     db_session.close()
 
 if __name__ == "__main__": main()
+
