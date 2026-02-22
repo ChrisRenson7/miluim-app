@@ -109,14 +109,20 @@ class Constraint(Base):
     end_time = Column(DateTime, nullable=False)
     reason = Column(String)
 
-# -------- תוספת לוגית: טבלת חוקי זוגיות --------
 class PairingRule(Base):
     __tablename__ = 'pairing_rules'
     id = Column(Integer, primary_key=True)
     user1_id = Column(Integer, ForeignKey('users.id'))
     user2_id = Column(Integer, ForeignKey('users.id'))
-    rule_type = Column(String) # יכול להיות 'BUDDY' או 'ANTI_BUDDY'
-# -----------------------------------------------
+    rule_type = Column(String) 
+
+# -------- תוספת לוגית: אילוצי עמדה --------
+class PostConstraint(Base):
+    __tablename__ = 'post_constraints'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    post_id = Column(Integer, ForeignKey('posts.id'))
+# ------------------------------------------
 
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
@@ -147,7 +153,11 @@ def get_shift_warnings(db_session, target_date):
             u_obj = db_session.query(User).get(int(uid))
             u_name = u_obj.name if u_obj else "שומר"
             
-            # בדיקת אילוצים
+            # בדיקת אילוצי עמדה (החייל חסום לעמדה זו)
+            pc = db_session.query(PostConstraint).filter_by(user_id=int(uid), post_id=s.post_id).first()
+            if pc: warnings[s.id] = f"אילוץ לשומר {u_name}: אינו מורשה לשמור בעמדה זו"
+            
+            # בדיקת אילוצים אישיים (שעות)
             c = db_session.query(Constraint).filter(Constraint.user_id == int(uid), Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
@@ -171,7 +181,6 @@ def auto_assign_shifts(db_session, target_date):
     unassigned_shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).order_by(Shift.start_time).all()
     users = db_session.query(User).all()
     
-    # חישוב שעות וטעינת חוקי זוגיות למילון מהיר
     all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
     user_stats = {str(u.id): {"total": 0.0, "daily": 0.0} for u in users}
     
@@ -180,6 +189,9 @@ def auto_assign_shifts(db_session, target_date):
     for r in pairing_rules:
         rules_dict[(str(r.user1_id), str(r.user2_id))] = r.rule_type
         rules_dict[(str(r.user2_id), str(r.user1_id))] = r.rule_type
+        
+    post_constraints = db_session.query(PostConstraint).all()
+    blocked_posts = {(pc.user_id, pc.post_id) for pc in post_constraints}
     
     for s in all_shifts:
         duration = (s.end_time - s.start_time).total_seconds() / 3600.0
@@ -201,6 +213,10 @@ def auto_assign_shifts(db_session, target_date):
                 uid_str = str(user.id)
                 if uid_str in assigned_list: continue
                 
+                # פסילה אם החייל חסום לעמדה הזו
+                if (user.id, shift.post_id) in blocked_posts:
+                    continue
+                
                 # פסילה על חפיפת זמנים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
@@ -208,7 +224,7 @@ def auto_assign_shifts(db_session, target_date):
                 # פסילה על אילוץ כללי
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
 
-                # -- התחשבות בחוקי הזוגיות --
+                # התחשבות בחוקי הזוגיות
                 is_anti_buddy = False
                 buddy_score = 0
                 for a_uid in assigned_list:
@@ -219,7 +235,6 @@ def auto_assign_shifts(db_session, target_date):
                     elif rule == 'BUDDY':
                         buddy_score += 1
                 
-                # אם יש הפרדת כוחות בינו לבין מי שכבר בעמדה, נפסול אותו למשמרת זו
                 if is_anti_buddy:
                     continue
 
@@ -232,7 +247,6 @@ def auto_assign_shifts(db_session, target_date):
                 candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest, "buddy_score": buddy_score})
             
             if candidates:
-                # מיון: קודם מי שנח מספיק > חמ"ד מקבל קדימות (-buddy_score) > מי ששמר פחות היום > מי ששמר פחות בכללי
                 candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, -c["buddy_score"], c["daily"], c["total"], -c["rest"]))
                 best = candidates[0]["user"]
                 best_uid = str(best.id)
@@ -514,6 +528,47 @@ def render_settings_tab(db_session):
                 st.rerun()
     else:
         st.info("יש להוסיף לפחות 2 חיילים למערכת בכרטיסיית 'כוח אדם' כדי להגדיר זוגות.")
+    
+    # -------- אזור מניעת שמירה בעמדות ספציפיות --------
+    st.divider()
+    st.subheader("🚫 אילוצי עמדות (מניעת שמירה בעמדה)")
+    if users and posts:
+        with st.expander("➕ הוספת אילוץ עמדה לחייל", expanded=False):
+            with st.form("add_post_constraint_form", clear_on_submit=True):
+                col_u, col_p = st.columns(2)
+                u_name = col_u.selectbox("בחר חייל:", [u.name for u in users])
+                p_name = col_p.selectbox("בחר עמדה שחסומה לו:", [p.name for p in posts])
+                
+                if st.form_submit_button("שמור אילוץ עמדה"):
+                    u_id = next(u.id for u in users if u.name == u_name)
+                    p_id = next(p.id for p in posts if p.name == p_name)
+                    
+                    if not db_session.query(PostConstraint).filter_by(user_id=u_id, post_id=p_id).first():
+                        db_session.add(PostConstraint(user_id=u_id, post_id=p_id))
+                        db_session.commit()
+                        st.success("אילוץ העמדה נשמר!")
+                        st.rerun()
+                    else:
+                        st.warning("האילוץ הזה כבר קיים במערכת.")
+                        
+        pcs = db_session.query(PostConstraint).all()
+        if pcs:
+            pc_data = []
+            for pc in pcs:
+                u_n = db_session.query(User).get(pc.user_id).name
+                p_n = db_session.query(Post).get(pc.post_id).name
+                pc_data.append({"ID": pc.id, "חייל": u_n, "עמדה חסומה": p_n, "למחיקה": False})
+            
+            df_pc = pd.DataFrame(pc_data)
+            df_pc = df_pc.iloc[:, ::-1] # היפוך עמודות ל-RTL
+            ed_pc = st.data_editor(df_pc, hide_index=True, use_container_width=True)
+            if st.button("מחק אילוצי עמדה מסומנים"):
+                for _, row in ed_pc.iterrows():
+                    if row["למחיקה"]:
+                        db_session.query(PostConstraint).filter_by(id=row["ID"]).delete()
+                db_session.commit()
+                st.rerun()
+
     # ----------------------------------------
 
     st.divider()
