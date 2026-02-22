@@ -142,16 +142,13 @@ def get_shift_warnings(db_session, target_date):
             c = db_session.query(Constraint).filter(Constraint.user_id == int(uid), Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
-            # בדיקת מנוחה (6 שעות) - תוקן באג זיהוי חלקי (Substring bug)
-            all_prev_shifts = db_session.query(Shift).filter(
-                Shift.end_time <= s.start_time
+            # בדיקת מנוחה (6 שעות) - אלגוריתם חסכוני ומהיר יותר
+            prev_shifts_candidates = db_session.query(Shift).filter(
+                Shift.end_time <= s.start_time,
+                Shift.assigned_user_ids.like(f"%{uid}%")
             ).order_by(Shift.end_time.desc()).all()
             
-            prev_s = None
-            for ps in all_prev_shifts:
-                if uid in (ps.assigned_user_ids or "").split(","):
-                    prev_s = ps
-                    break
+            prev_s = next((ps for ps in prev_shifts_candidates if uid in (ps.assigned_user_ids or "").split(",")), None)
             
             if prev_s:
                 rest = (s.start_time - prev_s.end_time).total_seconds() / 3600
@@ -165,7 +162,6 @@ def auto_assign_shifts(db_session, target_date):
     unassigned_shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).order_by(Shift.start_time).all()
     users = db_session.query(User).all()
     
-    # חישוב שעות דינאמי ומוודא עצמו מהמסד נתונים כדי שיתחשב גם בשינויים ידניים!
     all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
     user_stats = {str(u.id): {"total": 0.0, "daily": 0.0} for u in users}
     
@@ -189,11 +185,9 @@ def auto_assign_shifts(db_session, target_date):
                 uid_str = str(user.id)
                 if uid_str in assigned_list: continue
                 
-                # פסילה על חפיפת זמנים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
                 
-                # פסילה על אילוץ
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
 
                 last_s = max([s for s in u_s if s.end_time <= shift.start_time], key=lambda x: x.end_time, default=None)
@@ -205,7 +199,6 @@ def auto_assign_shifts(db_session, target_date):
                 candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest})
             
             if candidates:
-                # הוגנות: 1. מספיק מנוחה 2. מעט שעות *היום* 3. מעט שעות בכללי 4. נח הכי הרבה
                 candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, c["daily"], c["total"], -c["rest"]))
                 best = candidates[0]["user"]
                 best_uid = str(best.id)
@@ -215,7 +208,7 @@ def auto_assign_shifts(db_session, target_date):
                 
                 user_stats[best_uid]["total"] += duration
                 user_stats[best_uid]["daily"] += duration
-                best.total_hours += duration  # שמירה רק לגיבוי, בפועל אנו מסתמכים על user_stats
+                best.total_hours += duration
                 shift.assigned_user_ids = ",".join(assigned_list)
     db_session.commit()
 
@@ -256,7 +249,7 @@ def render_dashboard_tab(db_session):
             p_shifts = db_session.query(Shift).filter(Shift.post_id == post.id, Shift.start_time >= start_view, Shift.start_time < end_view).order_by(Shift.start_time).all()
             
             if not p_shifts:
-                st.caption("אין משמרות פעילות")
+                st.caption("אין משמרות פעילות בתאריך זה")
                 continue
 
             data = []
@@ -265,7 +258,6 @@ def render_dashboard_tab(db_session):
             for s in p_shifts:
                 err_mark = "🛑 " if s.id in warnings_dict else ""
                 assigned = (s.assigned_user_ids or "").split(",")
-                # תוקן: מציג עכשיו טווח שעות מלא (התחלה - סיום)
                 row = {"ID": s.id, "זמן": f"{err_mark}{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}"}
                 for j in range(max_g):
                     row[f"שומר {j+1}"] = id_to_name.get(assigned[j] if j < len(assigned) else "", "-- פנוי --")
@@ -430,4 +422,40 @@ def render_settings_tab(db_session):
 
     st.divider()
     st.subheader("📅 ייצור סלוטים")
-    g
+    g_date = st.date_input("יום לייצור:", date.today())
+    if st.button("ייצר סלוטים ריקים לתאריך זה", type="primary"):
+        for p in posts:
+            curr = datetime.combine(g_date, time(0,0))
+            while curr < datetime.combine(g_date, time(0,0)) + timedelta(days=1):
+                if is_time_in_range(p.active_from, p.active_to, curr.time()):
+                    req = p.required_guards
+                    if p.boost_guards > 0 and is_time_in_range(p.boost_from, p.boost_to, curr.time()):
+                        req += p.boost_guards
+                    if not db_session.query(Shift).filter_by(post_id=p.id, start_time=curr).first():
+                        db_session.add(Shift(post_id=p.id, start_time=curr, 
+                                           end_time=curr + timedelta(minutes=p.shift_length_minutes),
+                                           required_count=req))
+                curr += timedelta(minutes=p.shift_length_minutes)
+        db_session.commit()
+        st.success("סלוטים נוצרו בהצלחה!")
+
+    st.markdown('<div class="danger-zone">', unsafe_allow_html=True)
+    if st.button("🗑️ מחיקת כל הסלוטים"):
+        db_session.query(Shift).delete()
+        db_session.commit()
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ==========================================
+# 6. Main
+# ==========================================
+def main():
+    db_session = SessionLocal()
+    st.title("ניהול שמירות מילואים 🇮🇱")
+    t1, t2, t3 = st.tabs(["דשבורד 🛡️", "כוח אדם 👥", "הגדרות ⚙️"])
+    with t1: render_dashboard_tab(db_session)
+    with t2: render_personnel_tab(db_session)
+    with t3: render_settings_tab(db_session)
+    db_session.close()
+
+if __name__ == "__main__": main()
