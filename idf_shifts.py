@@ -7,7 +7,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ==========================================
 # 0. הגדרות תצוגה ו-RTL
 # ==========================================
-st.set_page_config(page_title="מערכת שיבוץ - מילואים", layout="wide")
+# שינוי ל-centered כדי לבטל את ה-wide mode
+st.set_page_config(page_title="מערכת שיבוץ - מילואים", layout="centered")
 
 st.markdown("""
     <style>
@@ -30,17 +31,18 @@ st.markdown("""
         text-align: right;
     }
     
-    /* יישור מסיבי לימין עבור כל התאים, הכותרות ותיבות הבחירה (Selectbox) בטבלה של הדשבורד */
+    /* התיקון הקריטי: דחיפת התוכן לקצה הימני של תאי הטבלה (Flex-end) */
     div[data-testid="stCellInner"], 
-    div[data-testid="stTableColumnHeaderInner"], 
-    td, th {
+    div[data-testid="stTableColumnHeaderInner"] {
+        justify-content: flex-end !important; 
         text-align: right !important;
-        justify-content: flex-start !important; 
-        direction: rtl !important;
     }
     
-    div[data-testid="stCellInner"] > div {
+    /* הגדרת RTL טבעית לטבלאות HTML של תצוגת צילום מסך */
+    table {
         direction: rtl !important;
+    }
+    th, td {
         text-align: right !important;
     }
 
@@ -298,6 +300,7 @@ def render_dashboard_tab(db_session):
     end_view = start_view + timedelta(days=1)
     
     warnings_dict = get_shift_warnings(db_session, selected_date)
+    # בגלל שעברנו ל-centered, הצגת עמודות יכולה להיות צפופה. Streamlit דואג לזה.
     post_cols = st.columns(len(posts))
     
     for i, post in enumerate(posts):
@@ -321,7 +324,7 @@ def render_dashboard_tab(db_session):
                 data.append(row)
             
             df = pd.DataFrame(data)
-            df = df.iloc[:, ::-1]  # הפוך את העמודות משמאל לימין ל-RTL
+            df = df.iloc[:, ::-1]  # היפוך למערכת הקנבס של Data Editor
             config = {"ID": None, "זמן": st.column_config.TextColumn(disabled=True)}
             for j in range(max_g):
                 config[f"שומר {j+1}"] = st.column_config.SelectboxColumn(options=["-- פנוי --"] + list(name_to_id.keys()))
@@ -373,7 +376,6 @@ def render_screenshot_tab(db_session):
             if not p_shifts:
                 continue
             
-            # כותרת נקייה בצבע שונה קצת
             st.markdown(f'<div class="post-header" style="background-color: #0f766e;">{post.name}</div>', unsafe_allow_html=True)
 
             data = []
@@ -388,8 +390,7 @@ def render_screenshot_tab(db_session):
             
             if data:
                 df = pd.DataFrame(data)
-                df = df.iloc[:, ::-1]  # הפוך את העמודות משמאל לימין ל-RTL
-                # st.table מייצר טבלת HTML סטטית לחלוטין - מעולה לצילומי מסך
+                # שינוי קריטי: לא הופכים כאן עמודות! טבלת HTML מגיבה אוטומטית ל-RTL
                 st.table(df.style.set_properties(**{'text-align': 'right', 'background-color': '#ffffff'}))
 
 # ==========================================
@@ -660,7 +661,6 @@ def render_settings_tab(db_session):
 def main():
     db_session = SessionLocal()
     st.title("ניהול שמירות מילואים 🇮🇱")
-    # שמתי את טאב צילום המסך במקום השני
     t1, t2, t3, t4 = st.tabs(["דשבורד 🛡️", "צילום מסך 📸", "כוח אדם 👥", "הגדרות ⚙️"])
     with t1: render_dashboard_tab(db_session)
     with t2: render_screenshot_tab(db_session)
