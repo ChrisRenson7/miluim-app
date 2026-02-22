@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, 
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ==========================================
-# 0. הגדרות תצוגה ו-RTL (ללא Wide Mode!)
+# 0. הגדרות תצוגה ו-RTL
 # ==========================================
 st.set_page_config(page_title="מערכת שיבוץ - מילואים", layout="centered")
 
@@ -24,7 +24,13 @@ st.markdown("""
         text-align: right;
     }
 
-    /* יישור טבלאות RTL ומרכוז תוכן */
+    /* רוחב דינאמי: מבטל גלילה אך נשאר קומפקטי ולא מתפזר על מסך רחב מדי */
+    .block-container {
+        max-width: 95% !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }
+
     [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
         direction: rtl;
         text-align: right;
@@ -46,9 +52,9 @@ st.markdown("""
 
     .stButton>button { width: 100%; font-weight: bold; border-radius: 8px; }
     
-    /* עיצוב כפתורים: כפתור Primary ירוק/חי במקום אדום */
+    /* עיצוב כפתורים: כפתור Primary ירוק-אמרלד (חי וידידותי) */
     button[kind="primary"] {
-        background-color: #059669 !important; /* ירוק אמרלד */
+        background-color: #059669 !important; 
         border-color: #059669 !important;
         color: white !important;
     }
@@ -57,12 +63,12 @@ st.markdown("""
         border-color: #047857 !important;
     }
 
-    /* כפתור נקה לוח - כחול/אפור כהה */
+    /* כפתור נקה לוח - צבע ניטרלי עדין */
     button[kind="secondary"] {
         border-color: #d1d5db !important;
     }
 
-    /* אזור סכנה ומחיקות נשאר באדום מובהק */
+    /* כפתורים מסוכנים (מחיקות איפוס) נשארים באדום */
     .danger-zone button {
         background-color: #dc2626 !important;
         border-color: #dc2626 !important;
@@ -168,6 +174,7 @@ class SystemSetting(Base):
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
 
+# QA Fix: שדרוג מסד הנתונים שקוף למשתמש למקרה שזה מסד ישן
 with engine.connect() as conn:
     try: conn.execute(text("ALTER TABLE users ADD COLUMN is_commander BOOLEAN DEFAULT 0"))
     except: pass
@@ -176,22 +183,28 @@ with engine.connect() as conn:
     conn.commit()
 
 SessionLocal = sessionmaker(bind=engine)
-
 MIN_REST_HOURS = 6
 
 # ==========================================
-# 2. פונקציות עזר ואלגוריתם שיבוץ
+# 2. פונקציות עזר ואלגוריתם שיבוץ משופר (AI)
 # ==========================================
 def is_time_in_range(start, end, current):
     if start <= end:
         return start <= current <= end
     return current >= start or current <= end
 
+def is_black_shift(start_dt, end_dt):
+    # מגדיר "משמרת שחורה" כמשמרת שאמצע הזמן שלה נופל בין 00:00 ל-06:00
+    midpoint = start_dt + (end_dt - start_dt) / 2
+    return 0 <= midpoint.hour < 6
+
 def get_shift_warnings(db_session, target_date, days_to_add=1):
     start_dt = datetime.combine(target_date, time(0,0))
     end_dt = start_dt + timedelta(days=days_to_add) 
     shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).all()
     warnings = {}
+    
+    # QA Optimization: Caching db calls for O(1) lookups
     posts_cache = {p.id: p for p in db_session.query(Post).all()}
     users_cache = {u.id: u for u in db_session.query(User).all()}
 
@@ -203,34 +216,29 @@ def get_shift_warnings(db_session, target_date, days_to_add=1):
             warnings[s.id] = f"בעמדת {post_obj.name if post_obj else s.post_id}: חסר שומר ({len(assigned_ids)}/{s.required_count})"
         
         if post_obj and post_obj.requires_commander and assigned_ids:
-            has_cmd = any(users_cache[uid].is_commander for uid in assigned_ids if uid in users_cache)
-            if not has_cmd:
+            if not any(users_cache[uid].is_commander for uid in assigned_ids if uid in users_cache):
                 warnings[s.id] = f"בעמדת {post_obj.name}: חובה לשבץ לפחות מפקד אחד (⭐)"
 
         for uid in assigned_ids:
             u_obj = users_cache.get(uid)
             u_name = u_obj.name if u_obj else "שומר"
             
-            pc = db_session.query(PostConstraint).filter_by(user_id=uid, post_id=s.post_id).first()
-            if pc: warnings[s.id] = f"אילוץ לשומר {u_name}: אינו מורשה לשמור בעמדה זו"
+            if db_session.query(PostConstraint).filter_by(user_id=uid, post_id=s.post_id).first():
+                warnings[s.id] = f"אילוץ לשומר {u_name}: אינו מורשה לשמור בעמדה זו"
             
             c = db_session.query(Constraint).filter(Constraint.user_id == uid, Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
-            prev_shifts_candidates = db_session.query(Shift).filter(
+            prev_s = db_session.query(Shift).filter(
                 Shift.end_time <= s.start_time,
                 Shift.assigned_user_ids.like(f"%{uid}%")
-            ).order_by(Shift.end_time.desc()).all()
-            
-            prev_s = next((ps for ps in prev_shifts_candidates if str(uid) in (ps.assigned_user_ids or "").split(",")), None)
+            ).order_by(Shift.end_time.desc()).first()
             
             if prev_s:
                 rest = (s.start_time - prev_s.end_time).total_seconds() / 3600
                 if rest < MIN_REST_HOURS:
                     prev_post_name = posts_cache[prev_s.post_id].name if prev_s.post_id in posts_cache else "לא ידוע"
-                    s_time = prev_s.start_time.strftime('%H:%M')
-                    e_time = prev_s.end_time.strftime('%H:%M')
-                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ)."
+                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({prev_s.start_time.strftime('%H:%M')}-{prev_s.end_time.strftime('%H:%M')}). נח {rest:.1f} ש' (אילוץ)."
     return warnings
 
 def auto_assign_shifts(db_session, target_date, days_to_add=1):
@@ -241,31 +249,35 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
     posts = {p.id: p for p in db_session.query(Post).all()}
     
     all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
-    user_stats = {str(u.id): {"total": 0.0, "daily": 0.0} for u in users}
     
-    pairing_rules = db_session.query(PairingRule).all()
-    rules_dict = {}
-    for r in pairing_rules:
-        rules_dict[(str(r.user1_id), str(r.user2_id))] = r.rule_type
-        rules_dict[(str(r.user2_id), str(r.user1_id))] = r.rule_type
-        
-    post_constraints = db_session.query(PostConstraint).all()
-    blocked_posts = {(pc.user_id, pc.post_id) for pc in post_constraints}
+    # ניתוח אנליטי לכל חייל כולל ספירת משמרות שחורות
+    user_stats = {str(u.id): {"total": 0.0, "daily": 0.0, "black_shifts": 0} for u in users}
     
     for s in all_shifts:
         duration = (s.end_time - s.start_time).total_seconds() / 3600.0
         is_today = start_dt <= s.start_time < end_dt
+        is_black = is_black_shift(s.start_time, s.end_time)
+        
         for uid in (s.assigned_user_ids or "").split(","):
             if uid in user_stats:
                 user_stats[uid]["total"] += duration
-                if is_today:
-                    user_stats[uid]["daily"] += duration
+                if is_today: user_stats[uid]["daily"] += duration
+                if is_black: user_stats[uid]["black_shifts"] += 1
+    
+    rules_dict = {
+        (str(r.user1_id), str(r.user2_id)): r.rule_type
+        for r in db_session.query(PairingRule).all()
+    }
+    rules_dict.update({(k[1], k[0]): v for k, v in rules_dict.items()}) # דו-כיווני
+        
+    blocked_posts = {(pc.user_id, pc.post_id) for pc in db_session.query(PostConstraint).all()}
     
     for shift in unassigned_shifts:
         assigned_list = [x for x in (shift.assigned_user_ids or "").split(",") if x]
         needed = shift.required_count - len(assigned_list)
         post_obj = posts.get(shift.post_id)
         req_cmd = post_obj.requires_commander if post_obj else False
+        current_is_black = is_black_shift(shift.start_time, shift.end_time)
         
         for _ in range(needed):
             db_session.flush()
@@ -277,33 +289,42 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 if uid_str in assigned_list: continue
                 if (user.id, shift.post_id) in blocked_posts: continue
                 
+                # חפיפות ואילוצים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
 
-                is_anti_buddy = False
-                buddy_score = 0
-                for a_uid in assigned_list:
-                    rule = rules_dict.get((uid_str, a_uid))
-                    if rule == 'ANTI_BUDDY':
-                        is_anti_buddy = True
-                        break
-                    elif rule == 'BUDDY':
-                        buddy_score += 1
+                is_anti_buddy = any(rules_dict.get((uid_str, a_uid)) == 'ANTI_BUDDY' for a_uid in assigned_list)
                 if is_anti_buddy: continue
+                
+                buddy_score = sum(1 for a_uid in assigned_list if rules_dict.get((uid_str, a_uid)) == 'BUDDY')
 
                 last_s = max([s for s in u_s if s.end_time <= shift.start_time], key=lambda x: x.end_time, default=None)
                 rest = (shift.start_time - last_s.end_time).total_seconds() / 3600.0 if last_s else 999
                 
-                total_h = user_stats[uid_str]["total"]
-                daily_h = user_stats[uid_str]["daily"]
-                
                 cmd_priority = 1 if (req_cmd and not has_cmd and user.is_commander) else 0
                 
-                candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest, "buddy_score": buddy_score, "cmd_priority": cmd_priority})
+                candidates.append({
+                    "user": user, 
+                    "total": user_stats[uid_str]["total"], 
+                    "daily": user_stats[uid_str]["daily"], 
+                    "rest": rest, 
+                    "buddy_score": buddy_score, 
+                    "cmd_priority": cmd_priority,
+                    "black_shifts": user_stats[uid_str]["black_shifts"]
+                })
             
             if candidates:
-                candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, -c["cmd_priority"], -c["buddy_score"], c["daily"], c["total"], -c["rest"]))
+                # מנוע הוגנות משופר: מנוחה > צורך במפקד > חמ"ד > הוגנות משמרות שחורות > שעות
+                candidates.sort(key=lambda c: (
+                    c["rest"] < MIN_REST_HOURS, 
+                    -c["cmd_priority"], 
+                    -c["buddy_score"], 
+                    c["black_shifts"] if current_is_black else 0, # הוגנות נטל שחור
+                    c["daily"], 
+                    c["total"], 
+                    -c["rest"]
+                ))
                 best = candidates[0]["user"]
                 best_uid = str(best.id)
                 
@@ -313,9 +334,14 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 duration = (shift.end_time - shift.start_time).total_seconds() / 3600.0
                 user_stats[best_uid]["total"] += duration
                 user_stats[best_uid]["daily"] += duration
+                if current_is_black: user_stats[best_uid]["black_shifts"] += 1
                 best.total_hours += duration
                 shift.assigned_user_ids = ",".join(assigned_list)
     db_session.commit()
+
+# הפונקציה שמתריעה לשרת שאנחנו רוצים לשמור מה-UI
+def flag_save():
+    st.session_state.save_clicked = True
 
 # ==========================================
 # 3. טאב דשבורד
@@ -349,10 +375,9 @@ def render_dashboard_tab(db_session):
                 st.rerun()
         with col_save:
             st.write("") 
-            if st.button("💾 שמור שינויים ידניים", type="primary", use_container_width=True):
-                # השמירה עכשיו מתבצעת אוטומטית למטה, הכפתור הזה רק משדר הצלחה ומרענן!
-                st.success("השינויים הידניים נשמרו בהצלחה!")
-                st.rerun()
+            # התיקון של השמירה - מפעיל את on_click
+            st.button("💾 שמור שינויים ידניים", type="primary", use_container_width=True, on_click=flag_save)
+            
     st.divider()
 
     time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
@@ -407,18 +432,23 @@ def render_dashboard_tab(db_session):
             edited_df = st.data_editor(df.style.set_properties(**{'text-align': 'right'}), 
                                        column_config=config, hide_index=True, key=f"d_{post.id}_{selected_date}", use_container_width=True)
             
-            # --- התיקון הקריטי: שמירה אוטומטית בזמן אמת ---
+            # עריכה חכמה: רק מכין את הנתונים ב-Session, ממתין לפקודת Commit
             for _, r in edited_df.iterrows():
                 s_obj = db_session.query(Shift).get(r["ID"])
                 u_names = [r[f"שומר {j+1}"] for j in range(max_g) if f"שומר {j+1}" in r and r[f"שומר {j+1}"] != "-- פנוי --"]
                 new_assigned = ",".join([name_to_id[n] for n in u_names if n in name_to_id])
                 if s_obj.assigned_user_ids != new_assigned:
                     s_obj.assigned_user_ids = new_assigned
-                    db_session.commit() # שומר מיד ברגע שעורכים משהו!
 
     if warnings_dict:
         st.markdown('<div class="alert-box"><strong>🚨 חריגות בלוח:</strong><br/>' + 
                     "<br/>".join([f"• {v}" for v in warnings_dict.values()]) + '</div>', unsafe_allow_html=True)
+
+    # QA Fix Application: רק אם לחצו על הכפתור למעלה - נשמור את כל מה שנאסף בלולאה
+    if st.session_state.get("save_clicked"):
+        db_session.commit()
+        st.session_state.save_clicked = False
+        st.success("השינויים הידניים נשמרו בהצלחה!")
 
 # ==========================================
 # 3.5. טאב תצוגה לצילום מסך (View Only)
@@ -528,19 +558,21 @@ def render_personnel_tab(db_session):
     
     summary = []
     for u in users:
-        total_real_hours = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in shifts if str(u.id) in (s.assigned_user_ids or "").split(",")])
-        row = {"ID": u.id, "שם": u.name, "מפקד?": u.is_commander, "סה\"כ שעות": round(total_real_hours, 1)}
+        u_shifts = [s for s in shifts if str(u.id) in (s.assigned_user_ids or "").split(",")]
+        total_real_hours = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in u_shifts])
+        black_shifts_count = sum(1 for s in u_shifts if is_black_shift(s.start_time, s.end_time))
+        
+        row = {"ID": u.id, "שם": u.name, "מפקד?": u.is_commander, "סה\"כ שעות": round(total_real_hours, 1), "משמרות 🌑": black_shifts_count}
         for p in posts:
-            p_hrs = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in shifts if s.post_id == p.id and str(u.id) in (s.assigned_user_ids or "").split(",")])
+            p_hrs = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in u_shifts if s.post_id == p.id])
             row[f"שעות ב-{p.name}"] = round(p_hrs, 1)
         row["למחיקה"] = False
         summary.append(row)
     
     if summary:
-        # --- תוספת אנליטיקה וגרפים ---
-        st.subheader("📊 אנליטיקת חלוקת נטל ושעות")
-        chart_data = pd.DataFrame(summary).set_index("שם")["סה\"כ שעות"]
-        st.bar_chart(chart_data, color="#059669")
+        st.subheader("📊 מפת חלוקת נטל (אינטראקטיבי)")
+        df_chart = pd.DataFrame(summary)
+        st.bar_chart(df_chart.set_index("שם")["סה\"כ שעות"], color="#059669")
         
         st.subheader("📋 ניהול סד\"כ קבוע")
         df_sum = pd.DataFrame(summary)
@@ -577,7 +609,7 @@ def render_personnel_tab(db_session):
 
     st.markdown('<div class="danger-zone">', unsafe_allow_html=True)
     st.subheader("⚠️ אזור סכנה")
-    if st.button("🔄 איפוס מונה שעות לכולם (לחיצה אדומה)"):
+    if st.button("🔄 איפוס מונה שעות לכולם"):
         for u in users: u.total_hours = 0
         db_session.commit()
         st.rerun()
