@@ -7,7 +7,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ==========================================
 # 0. הגדרות תצוגה ו-RTL
 # ==========================================
-# שינוי ל-centered כדי לבטל את ה-wide mode
+# החזרנו ל-centered, אבל נשנה את ההתנהגות שלו דרך ה-CSS למטה 
 st.set_page_config(page_title="מערכת שיבוץ - מילואים", layout="centered")
 
 st.markdown("""
@@ -25,13 +25,20 @@ st.markdown("""
         text-align: right;
     }
 
+    /* תיקון רוחב: מבטל את כליאת המסך הממורכז, ונותן לו להתרחב עד 100% כדי למנוע סקרול (גלילה) */
+    .block-container {
+        max-width: 100% !important;
+        width: 100% !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+    }
+
     /* יישור טבלאות RTL ומרכוז תוכן */
     [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
         direction: rtl;
         text-align: right;
     }
     
-    /* התיקון הקריטי: דחיפת התוכן לקצה הימני של תאי הטבלה (Flex-end) */
     div[data-testid="stCellInner"], 
     div[data-testid="stTableColumnHeaderInner"] {
         justify-content: flex-end !important; 
@@ -41,6 +48,7 @@ st.markdown("""
     /* הגדרת RTL טבעית לטבלאות HTML של תצוגת צילום מסך */
     table {
         direction: rtl !important;
+        width: 100% !important;
     }
     th, td {
         text-align: right !important;
@@ -127,13 +135,17 @@ class PairingRule(Base):
     user2_id = Column(Integer, ForeignKey('users.id'))
     rule_type = Column(String) 
 
-# -------- תוספת לוגית: אילוצי עמדה --------
 class PostConstraint(Base):
     __tablename__ = 'post_constraints'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'))
     post_id = Column(Integer, ForeignKey('posts.id'))
-# ------------------------------------------
+
+# טבלה חדשה להגדרות המערכת
+class SystemSetting(Base):
+    __tablename__ = 'system_settings'
+    key = Column(String, primary_key=True)
+    value = Column(String)
 
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
@@ -164,15 +176,12 @@ def get_shift_warnings(db_session, target_date):
             u_obj = db_session.query(User).get(int(uid))
             u_name = u_obj.name if u_obj else "שומר"
             
-            # בדיקת אילוצי עמדה (החייל חסום לעמדה זו)
             pc = db_session.query(PostConstraint).filter_by(user_id=int(uid), post_id=s.post_id).first()
             if pc: warnings[s.id] = f"אילוץ לשומר {u_name}: אינו מורשה לשמור בעמדה זו"
             
-            # בדיקת אילוצים אישיים (שעות)
             c = db_session.query(Constraint).filter(Constraint.user_id == int(uid), Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
-            # בדיקת מנוחה (6 שעות)
             prev_shifts_candidates = db_session.query(Shift).filter(
                 Shift.end_time <= s.start_time,
                 Shift.assigned_user_ids.like(f"%{uid}%")
@@ -183,7 +192,11 @@ def get_shift_warnings(db_session, target_date):
             if prev_s:
                 rest = (s.start_time - prev_s.end_time).total_seconds() / 3600
                 if rest < MIN_REST_HOURS:
-                    warnings[s.id] = f"חריגת מנוחה לשומר {u_name}: {rest:.1f} ש' בלבד"
+                    # שיפור הודעת השגיאה - פירוט היכן שמר קודם וסימון אילוץ
+                    prev_post_name = db_session.query(Post).get(prev_s.post_id).name
+                    s_time = prev_s.start_time.strftime('%H:%M')
+                    e_time = prev_s.end_time.strftime('%H:%M')
+                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ)."
     return warnings
 
 def auto_assign_shifts(db_session, target_date):
@@ -224,18 +237,13 @@ def auto_assign_shifts(db_session, target_date):
                 uid_str = str(user.id)
                 if uid_str in assigned_list: continue
                 
-                # פסילה אם החייל חסום לעמדה הזו
-                if (user.id, shift.post_id) in blocked_posts:
-                    continue
+                if (user.id, shift.post_id) in blocked_posts: continue
                 
-                # פסילה על חפיפת זמנים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
                 
-                # פסילה על אילוץ כללי
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
 
-                # התחשבות בחוקי הזוגיות
                 is_anti_buddy = False
                 buddy_score = 0
                 for a_uid in assigned_list:
@@ -246,8 +254,7 @@ def auto_assign_shifts(db_session, target_date):
                     elif rule == 'BUDDY':
                         buddy_score += 1
                 
-                if is_anti_buddy:
-                    continue
+                if is_anti_buddy: continue
 
                 last_s = max([s for s in u_s if s.end_time <= shift.start_time], key=lambda x: x.end_time, default=None)
                 rest = (shift.start_time - last_s.end_time).total_seconds() / 3600.0 if last_s else 999
@@ -277,7 +284,7 @@ def auto_assign_shifts(db_session, target_date):
 def render_dashboard_tab(db_session):
     st.header("לוח שיבוצים מרכזי 🛡️")
     
-    col_ctrl, col_date = st.columns([2,1])
+    col_ctrl, col_date, col_clear = st.columns([2, 1, 1])
     with col_date:
         selected_date = st.date_input("בחר יום:", date.today())
     with col_ctrl:
@@ -286,6 +293,21 @@ def render_dashboard_tab(db_session):
             auto_assign_shifts(db_session, selected_date)
             st.success("השיבוץ הושלם!")
             st.rerun()
+    with col_clear:
+        st.write("") 
+        if st.button("🧹 נקה לוח", type="secondary"):
+            start_view_clear = datetime.combine(selected_date, time(0,0))
+            end_view_clear = start_view_clear + timedelta(days=1)
+            shifts_to_clear = db_session.query(Shift).filter(Shift.start_time >= start_view_clear, Shift.start_time < end_view_clear).all()
+            for s in shifts_to_clear:
+                s.assigned_user_ids = ""
+            db_session.commit()
+            st.success("הלוח לאותו יום נוקה בהצלחה!")
+            st.rerun()
+
+    # קריאת הגדרת שעות
+    time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
+    time_format_full = True if not time_setting or time_setting.value == "full" else False
 
     users = db_session.query(User).all()
     posts = db_session.query(Post).all()
@@ -300,7 +322,6 @@ def render_dashboard_tab(db_session):
     end_view = start_view + timedelta(days=1)
     
     warnings_dict = get_shift_warnings(db_session, selected_date)
-    # בגלל שעברנו ל-centered, הצגת עמודות יכולה להיות צפופה. Streamlit דואג לזה.
     post_cols = st.columns(len(posts))
     
     for i, post in enumerate(posts):
@@ -318,13 +339,17 @@ def render_dashboard_tab(db_session):
             for s in p_shifts:
                 err_mark = "🛑 " if s.id in warnings_dict else ""
                 assigned = (s.assigned_user_ids or "").split(",")
-                row = {"ID": s.id, "זמן": f"{err_mark}{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}"}
+                
+                # תצוגת השעות בהתאם להגדרה
+                t_str = f"{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}" if time_format_full else s.start_time.strftime('%H:%M')
+                
+                row = {"ID": s.id, "זמן": f"{err_mark}{t_str}"}
                 for j in range(max_g):
                     row[f"שומר {j+1}"] = id_to_name.get(assigned[j] if j < len(assigned) else "", "-- פנוי --")
                 data.append(row)
             
             df = pd.DataFrame(data)
-            df = df.iloc[:, ::-1]  # היפוך למערכת הקנבס של Data Editor
+            df = df.iloc[:, ::-1] 
             config = {"ID": None, "זמן": st.column_config.TextColumn(disabled=True)}
             for j in range(max_g):
                 config[f"שומר {j+1}"] = st.column_config.SelectboxColumn(options=["-- פנוי --"] + list(name_to_id.keys()))
@@ -356,6 +381,9 @@ def render_screenshot_tab(db_session):
     
     selected_date = st.date_input("בחר יום לתצוגה:", date.today(), key="screenshot_date")
     
+    time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
+    time_format_full = True if not time_setting or time_setting.value == "full" else False
+    
     users = db_session.query(User).all()
     posts = db_session.query(Post).all()
     id_to_name = {str(u.id): u.name for u in users}
@@ -383,14 +411,16 @@ def render_screenshot_tab(db_session):
             
             for s in p_shifts:
                 assigned = (s.assigned_user_ids or "").split(",")
-                row = {"זמן": f"{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}"}
+                t_str = f"{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}" if time_format_full else s.start_time.strftime('%H:%M')
+                
+                row = {"זמן": t_str}
                 for j in range(max_g):
                     row[f"שומר {j+1}"] = id_to_name.get(assigned[j] if j < len(assigned) else "", "— פנוי —")
                 data.append(row)
             
             if data:
                 df = pd.DataFrame(data)
-                # שינוי קריטי: לא הופכים כאן עמודות! טבלת HTML מגיבה אוטומטית ל-RTL
+                # לא הופכים כאן עמודות בפייתון כדי למנוע היפוך כפול. הטבלה נשארת נכונה מימין לשמאל.
                 st.table(df.style.set_properties(**{'text-align': 'right', 'background-color': '#ffffff'}))
 
 # ==========================================
@@ -532,7 +562,6 @@ def render_settings_tab(db_session):
             db_session.commit()
             st.rerun()
 
-    # -------- אזור הגדרת זוגות חמ"ד --------
     st.divider()
     st.subheader("🤝 ניהול זוגות (חמ\"ד / הפרדת כוחות)")
     users = db_session.query(User).all()
@@ -587,7 +616,6 @@ def render_settings_tab(db_session):
     else:
         st.info("יש להוסיף לפחות 2 חיילים למערכת בכרטיסיית 'כוח אדם' כדי להגדיר זוגות.")
     
-    # -------- אזור מניעת שמירה בעמדות ספציפיות --------
     st.divider()
     st.subheader("🚫 אילוצי עמדות (מניעת שמירה בעמדה)")
     if users and posts:
@@ -627,6 +655,24 @@ def render_settings_tab(db_session):
                 db_session.commit()
                 st.rerun()
 
+    # -------- אזור הגדרת מערכת כלליות (זמן) --------
+    st.divider()
+    st.subheader("🛠️ הגדרות מערכת כלליות")
+    time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
+    curr_time_val = time_setting.value if time_setting else "full"
+    
+    new_time_val = st.radio("תצוגת שעות בטבלאות השיבוץ:", 
+                       options=["full", "short"], 
+                       format_func=lambda x: "טווח מלא (לדוגמה: 08:00 - 10:00)" if x == "full" else "שעת התחלה בלבד (לדוגמה: 08:00)",
+                       index=0 if curr_time_val == "full" else 1)
+                       
+    if new_time_val != curr_time_val:
+        if not time_setting:
+            db_session.add(SystemSetting(key="time_display", value=new_time_val))
+        else:
+            time_setting.value = new_time_val
+        db_session.commit()
+        st.rerun()
     # ----------------------------------------
 
     st.divider()
