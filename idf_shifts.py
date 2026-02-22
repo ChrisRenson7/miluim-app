@@ -109,6 +109,15 @@ class Constraint(Base):
     end_time = Column(DateTime, nullable=False)
     reason = Column(String)
 
+# -------- תוספת לוגית: טבלת חוקי זוגיות --------
+class PairingRule(Base):
+    __tablename__ = 'pairing_rules'
+    id = Column(Integer, primary_key=True)
+    user1_id = Column(Integer, ForeignKey('users.id'))
+    user2_id = Column(Integer, ForeignKey('users.id'))
+    rule_type = Column(String) # יכול להיות 'BUDDY' או 'ANTI_BUDDY'
+# -----------------------------------------------
+
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
@@ -142,7 +151,7 @@ def get_shift_warnings(db_session, target_date):
             c = db_session.query(Constraint).filter(Constraint.user_id == int(uid), Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
-            # בדיקת מנוחה (6 שעות) - אלגוריתם חסכוני ומהיר יותר
+            # בדיקת מנוחה (6 שעות)
             prev_shifts_candidates = db_session.query(Shift).filter(
                 Shift.end_time <= s.start_time,
                 Shift.assigned_user_ids.like(f"%{uid}%")
@@ -162,8 +171,15 @@ def auto_assign_shifts(db_session, target_date):
     unassigned_shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).order_by(Shift.start_time).all()
     users = db_session.query(User).all()
     
+    # חישוב שעות וטעינת חוקי זוגיות למילון מהיר
     all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
     user_stats = {str(u.id): {"total": 0.0, "daily": 0.0} for u in users}
+    
+    pairing_rules = db_session.query(PairingRule).all()
+    rules_dict = {}
+    for r in pairing_rules:
+        rules_dict[(str(r.user1_id), str(r.user2_id))] = r.rule_type
+        rules_dict[(str(r.user2_id), str(r.user1_id))] = r.rule_type
     
     for s in all_shifts:
         duration = (s.end_time - s.start_time).total_seconds() / 3600.0
@@ -185,10 +201,27 @@ def auto_assign_shifts(db_session, target_date):
                 uid_str = str(user.id)
                 if uid_str in assigned_list: continue
                 
+                # פסילה על חפיפת זמנים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
                 
+                # פסילה על אילוץ כללי
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
+
+                # -- התחשבות בחוקי הזוגיות --
+                is_anti_buddy = False
+                buddy_score = 0
+                for a_uid in assigned_list:
+                    rule = rules_dict.get((uid_str, a_uid))
+                    if rule == 'ANTI_BUDDY':
+                        is_anti_buddy = True
+                        break
+                    elif rule == 'BUDDY':
+                        buddy_score += 1
+                
+                # אם יש הפרדת כוחות בינו לבין מי שכבר בעמדה, נפסול אותו למשמרת זו
+                if is_anti_buddy:
+                    continue
 
                 last_s = max([s for s in u_s if s.end_time <= shift.start_time], key=lambda x: x.end_time, default=None)
                 rest = (shift.start_time - last_s.end_time).total_seconds() / 3600.0 if last_s else 999
@@ -196,10 +229,11 @@ def auto_assign_shifts(db_session, target_date):
                 total_h = user_stats[uid_str]["total"]
                 daily_h = user_stats[uid_str]["daily"]
                 
-                candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest})
+                candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest, "buddy_score": buddy_score})
             
             if candidates:
-                candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, c["daily"], c["total"], -c["rest"]))
+                # מיון: קודם מי שנח מספיק > חמ"ד מקבל קדימות (-buddy_score) > מי ששמר פחות היום > מי ששמר פחות בכללי
+                candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, -c["buddy_score"], c["daily"], c["total"], -c["rest"]))
                 best = candidates[0]["user"]
                 best_uid = str(best.id)
                 
@@ -264,6 +298,7 @@ def render_dashboard_tab(db_session):
                 data.append(row)
             
             df = pd.DataFrame(data)
+            df = df.iloc[:, ::-1]  # הפוך את העמודות משמאל לימין ל-RTL
             config = {"ID": None, "זמן": st.column_config.TextColumn(disabled=True)}
             for j in range(max_g):
                 config[f"שומר {j+1}"] = st.column_config.SelectboxColumn(options=["-- פנוי --"] + list(name_to_id.keys()))
@@ -273,7 +308,7 @@ def render_dashboard_tab(db_session):
             
             for _, r in edited_df.iterrows():
                 s_obj = db_session.query(Shift).get(r["ID"])
-                u_names = [r[f"שומר {j+1}"] for j in range(max_g) if r[f"שומר {j+1}"] != "-- פנוי --"]
+                u_names = [r[f"שומר {j+1}"] for j in range(max_g) if f"שומר {j+1}" in r and r[f"שומר {j+1}"] != "-- פנוי --"]
                 s_obj.assigned_user_ids = ",".join([name_to_id[n] for n in u_names if n in name_to_id])
 
     if warnings_dict:
@@ -347,6 +382,7 @@ def render_personnel_tab(db_session):
     if summary:
         st.subheader("📊 פירוט שעות שמירה")
         df_sum = pd.DataFrame(summary)
+        df_sum = df_sum.iloc[:, ::-1] # היפוך עמודות
         ed_p = st.data_editor(df_sum.style.set_properties(**{'text-align': 'center'}), hide_index=True, use_container_width=True)
         
         if st.button("💾 שמור שינויים / מחק מסומנים"):
@@ -364,7 +400,9 @@ def render_personnel_tab(db_session):
             for c in constraints:
                 u_n = db_session.query(User.name).filter_by(id=c.user_id).scalar()
                 c_data.append({"ID": c.id, "חייל": u_n, "התחלה": c.start_time.strftime('%d/%m %H:%M'), "סיום": c.end_time.strftime('%d/%m %H:%M'), "סיבה": c.reason, "מחק": False})
-            ed_c = st.data_editor(pd.DataFrame(c_data), hide_index=True, use_container_width=True)
+            df_c = pd.DataFrame(c_data)
+            df_c = df_c.iloc[:, ::-1] # היפוך עמודות
+            ed_c = st.data_editor(df_c, hide_index=True, use_container_width=True)
             if st.button("מחק אילוצים מסומנים"):
                 for _, r in ed_c.iterrows():
                     if r["מחק"]: db_session.delete(db_session.query(Constraint).get(r["ID"]))
@@ -411,7 +449,9 @@ def render_settings_tab(db_session):
     if posts:
         st.subheader("ניהול עמדות")
         p_list = [{"ID": p.id, "שם": p.name, "משך": p.shift_length_minutes, "שומרים": p.required_guards, "למחיקה": False} for p in posts]
-        ed_p = st.data_editor(pd.DataFrame(p_list), hide_index=True, use_container_width=True)
+        df_p = pd.DataFrame(p_list)
+        df_p = df_p.iloc[:, ::-1] # היפוך עמודות
+        ed_p = st.data_editor(df_p, hide_index=True, use_container_width=True)
         if st.button("מחק עמדות מסומנות"):
             for _, r in ed_p.iterrows():
                 if r["למחיקה"]: 
@@ -419,6 +459,62 @@ def render_settings_tab(db_session):
                     db_session.delete(db_session.query(Post).get(r["ID"]))
             db_session.commit()
             st.rerun()
+
+    # -------- אזור הגדרת זוגות חמ"ד --------
+    st.divider()
+    st.subheader("🤝 ניהול זוגות (חמ\"ד / הפרדת כוחות)")
+    users = db_session.query(User).all()
+    if len(users) >= 2:
+        with st.expander("➕ הוספת כלל זוגיות חדש", expanded=False):
+            with st.form("add_pairing_form", clear_on_submit=True):
+                u_names = [u.name for u in users]
+                col_p1, col_p2, col_p3 = st.columns(3)
+                u1_name = col_p1.selectbox("חייל א'", u_names, key="u1")
+                u2_name = col_p2.selectbox("חייל ב'", u_names, key="u2")
+                r_type = col_p3.selectbox("סוג קשר", ["חמ\"ד (תמיד יחד) 🟢", "הפרדת כוחות (לעולם לא יחד) 🔴"])
+                
+                if st.form_submit_button("שמור כלל זוגיות"):
+                    if u1_name == u2_name:
+                        st.error("לא ניתן לבחור את אותו חייל בשני הצדדים.")
+                    else:
+                        u1_id = next(u.id for u in users if u.name == u1_name)
+                        u2_id = next(u.id for u in users if u.name == u2_name)
+                        
+                        existing = db_session.query(PairingRule).filter(
+                            ((PairingRule.user1_id == u1_id) & (PairingRule.user2_id == u2_id)) |
+                            ((PairingRule.user1_id == u2_id) & (PairingRule.user2_id == u1_id))
+                        ).first()
+                        
+                        if existing:
+                            st.warning("כבר קיים כלל עבור זוג זה. מחק אותו קודם כדי לעדכן סוג.")
+                        else:
+                            db_type = 'BUDDY' if "חמ\"ד" in r_type else 'ANTI_BUDDY'
+                            db_session.add(PairingRule(user1_id=u1_id, user2_id=u2_id, rule_type=db_type))
+                            db_session.commit()
+                            st.success("הכלל נשמר בהצלחה!")
+                            st.rerun()
+
+        rules = db_session.query(PairingRule).all()
+        if rules:
+            r_data = []
+            for r in rules:
+                u1 = db_session.query(User).get(r.user1_id).name
+                u2 = db_session.query(User).get(r.user2_id).name
+                rt = "חמ\"ד 🟢" if r.rule_type == 'BUDDY' else "הפרדת כוחות 🔴"
+                r_data.append({"ID": r.id, "חייל א'": u1, "חייל ב'": u2, "סוג קשר": rt, "למחיקה": False})
+            
+            df_r = pd.DataFrame(r_data)
+            df_r = df_r.iloc[:, ::-1] # היפוך עמודות
+            ed_r = st.data_editor(df_r, hide_index=True, use_container_width=True)
+            if st.button("מחק כללי זוגיות מסומנים"):
+                for _, row in ed_r.iterrows():
+                    if row["למחיקה"]:
+                        db_session.query(PairingRule).filter_by(id=row["ID"]).delete()
+                db_session.commit()
+                st.rerun()
+    else:
+        st.info("יש להוסיף לפחות 2 חיילים למערכת בכרטיסיית 'כוח אדם' כדי להגדיר זוגות.")
+    # ----------------------------------------
 
     st.divider()
     st.subheader("📅 ייצור סלוטים")
