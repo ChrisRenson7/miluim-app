@@ -24,7 +24,6 @@ st.markdown("""
         text-align: right;
     }
 
-    /* רוחב דינאמי: מבטל גלילה אך נשאר קומפקטי ולא מתפזר על מסך רחב מדי */
     .block-container {
         max-width: 95% !important;
         padding-left: 1rem !important;
@@ -52,7 +51,6 @@ st.markdown("""
 
     .stButton>button { width: 100%; font-weight: bold; border-radius: 8px; }
     
-    /* עיצוב כפתורים: כפתור Primary ירוק-אמרלד (חי וידידותי) */
     button[kind="primary"] {
         background-color: #059669 !important; 
         border-color: #059669 !important;
@@ -63,12 +61,10 @@ st.markdown("""
         border-color: #047857 !important;
     }
 
-    /* כפתור נקה לוח - צבע ניטרלי עדין */
     button[kind="secondary"] {
         border-color: #d1d5db !important;
     }
 
-    /* כפתורים מסוכנים (מחיקות איפוס) נשארים באדום */
     .danger-zone button {
         background-color: #dc2626 !important;
         border-color: #dc2626 !important;
@@ -174,7 +170,6 @@ class SystemSetting(Base):
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
 
-# QA Fix: שדרוג מסד הנתונים שקוף למשתמש למקרה שזה מסד ישן
 with engine.connect() as conn:
     try: conn.execute(text("ALTER TABLE users ADD COLUMN is_commander BOOLEAN DEFAULT 0"))
     except: pass
@@ -186,15 +181,13 @@ SessionLocal = sessionmaker(bind=engine)
 MIN_REST_HOURS = 6
 
 # ==========================================
-# 2. פונקציות עזר ואלגוריתם שיבוץ משופר (AI)
+# 2. פונקציות עזר ואלגוריתם שיבוץ משופר
 # ==========================================
 def is_time_in_range(start, end, current):
-    if start <= end:
-        return start <= current <= end
+    if start <= end: return start <= current <= end
     return current >= start or current <= end
 
 def is_black_shift(start_dt, end_dt):
-    # מגדיר "משמרת שחורה" כמשמרת שאמצע הזמן שלה נופל בין 00:00 ל-06:00
     midpoint = start_dt + (end_dt - start_dt) / 2
     return 0 <= midpoint.hour < 6
 
@@ -202,14 +195,20 @@ def get_shift_warnings(db_session, target_date, days_to_add=1):
     start_dt = datetime.combine(target_date, time(0,0))
     end_dt = start_dt + timedelta(days=days_to_add) 
     shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).all()
-    warnings = {}
     
-    # QA Optimization: Caching db calls for O(1) lookups
+    # הבאת היסטוריה של 24 שעות אחורה לטובת חישובי מנוחה מדויקים של המחליפים!
+    history_dt = start_dt - timedelta(hours=24)
+    all_recent_shifts = db_session.query(Shift).filter(Shift.start_time >= history_dt, Shift.start_time < end_dt).all()
+    
+    warnings = {}
     posts_cache = {p.id: p for p in db_session.query(Post).all()}
     users_cache = {u.id: u for u in db_session.query(User).all()}
+    pcs_cache = db_session.query(PostConstraint).all()
+    constraints_cache = db_session.query(Constraint).filter(Constraint.end_time >= start_dt).all()
 
     for s in shifts:
-        assigned_ids = [int(x) for x in (s.assigned_user_ids or "").split(",") if x]
+        assigned_ids_str = (s.assigned_user_ids or "").split(",")
+        assigned_ids = [int(x) for x in assigned_ids_str if x]
         post_obj = posts_cache.get(s.post_id)
         
         if len(assigned_ids) < s.required_count:
@@ -223,22 +222,56 @@ def get_shift_warnings(db_session, target_date, days_to_add=1):
             u_obj = users_cache.get(uid)
             u_name = u_obj.name if u_obj else "שומר"
             
-            if db_session.query(PostConstraint).filter_by(user_id=uid, post_id=s.post_id).first():
+            if any(pc.user_id == uid and pc.post_id == s.post_id for pc in pcs_cache):
                 warnings[s.id] = f"אילוץ לשומר {u_name}: אינו מורשה לשמור בעמדה זו"
             
-            c = db_session.query(Constraint).filter(Constraint.user_id == uid, Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
-            if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
+            if any(c.user_id == uid and c.start_time < s.end_time and c.end_time > s.start_time for c in constraints_cache):
+                warnings[s.id] = f"אילוץ לשומר {u_name}: חסום בשעות אלו"
             
-            prev_s = db_session.query(Shift).filter(
-                Shift.end_time <= s.start_time,
-                Shift.assigned_user_ids.like(f"%{uid}%")
-            ).order_by(Shift.end_time.desc()).first()
+            prev_shifts = [os for os in all_recent_shifts if str(uid) in (os.assigned_user_ids or "").split(",") and os.end_time <= s.start_time and os.id != s.id]
+            prev_s = max(prev_shifts, key=lambda x: x.end_time, default=None)
             
             if prev_s:
                 rest = (s.start_time - prev_s.end_time).total_seconds() / 3600
                 if rest < MIN_REST_HOURS:
                     prev_post_name = posts_cache[prev_s.post_id].name if prev_s.post_id in posts_cache else "לא ידוע"
-                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({prev_s.start_time.strftime('%H:%M')}-{prev_s.end_time.strftime('%H:%M')}). נח {rest:.1f} ש' (אילוץ)."
+                    s_time = prev_s.start_time.strftime('%H:%M')
+                    e_time = prev_s.end_time.strftime('%H:%M')
+                    
+                    # --- מנוע מציאת המחליף האידיאלי ---
+                    best_rep = None
+                    max_rep_rest = -1
+                    
+                    for rep_u in users_cache.values():
+                        rep_uid_str = str(rep_u.id)
+                        if rep_uid_str in assigned_ids_str: continue # כבר שומר במשמרת הזו
+                        
+                        # סינון חסימות עמדה לחייל האופציונלי
+                        if any(pc.user_id == rep_u.id and pc.post_id == s.post_id for pc in pcs_cache): continue
+                        # סינון אילוצי זמינות
+                        if any(c.user_id == rep_u.id and c.start_time < s.end_time and c.end_time > s.start_time for c in constraints_cache): continue
+                        
+                        # בדיקה שהמחליף לא שומר כרגע במשמרת מקבילה בעמדה אחרת
+                        overlaps = any(str(rep_u.id) in (os.assigned_user_ids or "").split(",") and max(s.start_time, os.start_time) < min(s.end_time, os.end_time) for os in all_recent_shifts if os.id != s.id)
+                        if overlaps: continue
+                        
+                        # חישוב המנוחה של המחליף הפוטנציאלי
+                        rep_prev_shifts = [os for os in all_recent_shifts if rep_uid_str in (os.assigned_user_ids or "").split(",") and os.end_time <= s.start_time]
+                        rep_last = max(rep_prev_shifts, key=lambda x: x.end_time, default=None)
+                        rep_rest = (s.start_time - rep_last.end_time).total_seconds() / 3600.0 if rep_last else 999
+                        
+                        if rep_rest > max_rep_rest:
+                            max_rep_rest = rep_rest
+                            best_rep = rep_u
+                            
+                    rec_str = ""
+                    if best_rep:
+                        rest_text = f"{max_rep_rest:.1f} ש'" if max_rep_rest != 999 else "יותר מ-24 ש'"
+                        rec_str = f" [💡 מומלץ להחליף עם: {best_rep.name} (נח {rest_text})]"
+                    else:
+                        rec_str = " [⚠️ אין אף מחליף פנוי]"
+                        
+                    warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ).{rec_str}"
     return warnings
 
 def auto_assign_shifts(db_session, target_date, days_to_add=1):
@@ -249,8 +282,6 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
     posts = {p.id: p for p in db_session.query(Post).all()}
     
     all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
-    
-    # ניתוח אנליטי לכל חייל כולל ספירת משמרות שחורות
     user_stats = {str(u.id): {"total": 0.0, "daily": 0.0, "black_shifts": 0} for u in users}
     
     for s in all_shifts:
@@ -268,7 +299,7 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
         (str(r.user1_id), str(r.user2_id)): r.rule_type
         for r in db_session.query(PairingRule).all()
     }
-    rules_dict.update({(k[1], k[0]): v for k, v in rules_dict.items()}) # דו-כיווני
+    rules_dict.update({(k[1], k[0]): v for k, v in rules_dict.items()}) 
         
     blocked_posts = {(pc.user_id, pc.post_id) for pc in db_session.query(PostConstraint).all()}
     
@@ -289,7 +320,6 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 if uid_str in assigned_list: continue
                 if (user.id, shift.post_id) in blocked_posts: continue
                 
-                # חפיפות ואילוצים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
                 if any(max(shift.start_time, s.start_time) < min(shift.end_time, s.end_time) for s in u_s if s.id != shift.id): continue
                 if db_session.query(Constraint).filter(Constraint.user_id == user.id, Constraint.start_time < shift.end_time, Constraint.end_time > shift.start_time).first(): continue
@@ -315,12 +345,11 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 })
             
             if candidates:
-                # מנוע הוגנות משופר: מנוחה > צורך במפקד > חמ"ד > הוגנות משמרות שחורות > שעות
                 candidates.sort(key=lambda c: (
                     c["rest"] < MIN_REST_HOURS, 
                     -c["cmd_priority"], 
                     -c["buddy_score"], 
-                    c["black_shifts"] if current_is_black else 0, # הוגנות נטל שחור
+                    c["black_shifts"] if current_is_black else 0, 
                     c["daily"], 
                     c["total"], 
                     -c["rest"]
@@ -339,7 +368,6 @@ def auto_assign_shifts(db_session, target_date, days_to_add=1):
                 shift.assigned_user_ids = ",".join(assigned_list)
     db_session.commit()
 
-# הפונקציה שמתריעה לשרת שאנחנו רוצים לשמור מה-UI
 def flag_save():
     st.session_state.save_clicked = True
 
@@ -375,7 +403,6 @@ def render_dashboard_tab(db_session):
                 st.rerun()
         with col_save:
             st.write("") 
-            # התיקון של השמירה - מפעיל את on_click
             st.button("💾 שמור שינויים ידניים", type="primary", use_container_width=True, on_click=flag_save)
             
     st.divider()
@@ -432,7 +459,6 @@ def render_dashboard_tab(db_session):
             edited_df = st.data_editor(df.style.set_properties(**{'text-align': 'right'}), 
                                        column_config=config, hide_index=True, key=f"d_{post.id}_{selected_date}", use_container_width=True)
             
-            # עריכה חכמה: רק מכין את הנתונים ב-Session, ממתין לפקודת Commit
             for _, r in edited_df.iterrows():
                 s_obj = db_session.query(Shift).get(r["ID"])
                 u_names = [r[f"שומר {j+1}"] for j in range(max_g) if f"שומר {j+1}" in r and r[f"שומר {j+1}"] != "-- פנוי --"]
@@ -444,7 +470,6 @@ def render_dashboard_tab(db_session):
         st.markdown('<div class="alert-box"><strong>🚨 חריגות בלוח:</strong><br/>' + 
                     "<br/>".join([f"• {v}" for v in warnings_dict.values()]) + '</div>', unsafe_allow_html=True)
 
-    # QA Fix Application: רק אם לחצו על הכפתור למעלה - נשמור את כל מה שנאסף בלולאה
     if st.session_state.get("save_clicked"):
         db_session.commit()
         st.session_state.save_clicked = False
