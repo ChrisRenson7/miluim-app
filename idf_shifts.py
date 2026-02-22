@@ -30,9 +30,18 @@ st.markdown("""
         text-align: right;
     }
     
-    div[data-testid="stCellInner"] {
+    /* יישור מסיבי לימין עבור כל התאים, הכותרות ותיבות הבחירה (Selectbox) בטבלה של הדשבורד */
+    div[data-testid="stCellInner"], 
+    div[data-testid="stTableColumnHeaderInner"], 
+    td, th {
         text-align: right !important;
-        justify-content: flex-start !important; /* flex-start with direction rtl means right */
+        justify-content: flex-start !important; 
+        direction: rtl !important;
+    }
+    
+    div[data-testid="stCellInner"] > div {
+        direction: rtl !important;
+        text-align: right !important;
     }
 
     .stButton>button { width: 100%; font-weight: bold; border-radius: 8px; }
@@ -336,6 +345,54 @@ def render_dashboard_tab(db_session):
         st.rerun()
 
 # ==========================================
+# 3.5. טאב תצוגה לצילום מסך (View Only)
+# ==========================================
+def render_screenshot_tab(db_session):
+    st.header("📸 תצוגה נקייה לצילום מסך")
+    st.caption("הטבלאות כאן חסומות לעריכה ומוצגות בפורמט נקי שנוח לצלם ולשלוח.")
+    
+    selected_date = st.date_input("בחר יום לתצוגה:", date.today(), key="screenshot_date")
+    
+    users = db_session.query(User).all()
+    posts = db_session.query(Post).all()
+    id_to_name = {str(u.id): u.name for u in users}
+    
+    if not posts:
+        st.info("אין עמדות במערכת.")
+        return
+
+    start_view = datetime.combine(selected_date, time(0,0))
+    end_view = start_view + timedelta(days=1)
+    
+    post_cols = st.columns(len(posts))
+    
+    for i, post in enumerate(posts):
+        with post_cols[i]:
+            p_shifts = db_session.query(Shift).filter(Shift.post_id == post.id, Shift.start_time >= start_view, Shift.start_time < end_view).order_by(Shift.start_time).all()
+            
+            if not p_shifts:
+                continue
+            
+            # כותרת נקייה בצבע שונה קצת
+            st.markdown(f'<div class="post-header" style="background-color: #0f766e;">{post.name}</div>', unsafe_allow_html=True)
+
+            data = []
+            max_g = max([s.required_count for s in p_shifts])
+            
+            for s in p_shifts:
+                assigned = (s.assigned_user_ids or "").split(",")
+                row = {"זמן": f"{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}"}
+                for j in range(max_g):
+                    row[f"שומר {j+1}"] = id_to_name.get(assigned[j] if j < len(assigned) else "", "— פנוי —")
+                data.append(row)
+            
+            if data:
+                df = pd.DataFrame(data)
+                df = df.iloc[:, ::-1]  # הפוך את העמודות משמאל לימין ל-RTL
+                # st.table מייצר טבלת HTML סטטית לחלוטין - מעולה לצילומי מסך
+                st.table(df.style.set_properties(**{'text-align': 'right', 'background-color': '#ffffff'}))
+
+# ==========================================
 # 4. טאב כוח אדם
 # ==========================================
 def render_personnel_tab(db_session):
@@ -603,10 +660,12 @@ def render_settings_tab(db_session):
 def main():
     db_session = SessionLocal()
     st.title("ניהול שמירות מילואים 🇮🇱")
-    t1, t2, t3 = st.tabs(["דשבורד 🛡️", "כוח אדם 👥", "הגדרות ⚙️"])
+    # שמתי את טאב צילום המסך במקום השני
+    t1, t2, t3, t4 = st.tabs(["דשבורד 🛡️", "צילום מסך 📸", "כוח אדם 👥", "הגדרות ⚙️"])
     with t1: render_dashboard_tab(db_session)
-    with t2: render_personnel_tab(db_session)
-    with t3: render_settings_tab(db_session)
+    with t2: render_screenshot_tab(db_session)
+    with t3: render_personnel_tab(db_session)
+    with t4: render_settings_tab(db_session)
     db_session.close()
 
 if __name__ == "__main__": main()
