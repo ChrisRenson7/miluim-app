@@ -142,11 +142,16 @@ def get_shift_warnings(db_session, target_date):
             c = db_session.query(Constraint).filter(Constraint.user_id == int(uid), Constraint.start_time < s.end_time, Constraint.end_time > s.start_time).first()
             if c: warnings[s.id] = f"אילוץ לשומר {u_name}: {c.reason}"
             
-            # בדיקת מנוחה (6 שעות)
-            prev_s = db_session.query(Shift).filter(
-                Shift.assigned_user_ids.contains(uid), 
+            # בדיקת מנוחה (6 שעות) - תוקן באג זיהוי חלקי (Substring bug)
+            all_prev_shifts = db_session.query(Shift).filter(
                 Shift.end_time <= s.start_time
-            ).order_by(Shift.end_time.desc()).first()
+            ).order_by(Shift.end_time.desc()).all()
+            
+            prev_s = None
+            for ps in all_prev_shifts:
+                if uid in (ps.assigned_user_ids or "").split(","):
+                    prev_s = ps
+                    break
             
             if prev_s:
                 rest = (s.start_time - prev_s.end_time).total_seconds() / 3600
@@ -260,7 +265,8 @@ def render_dashboard_tab(db_session):
             for s in p_shifts:
                 err_mark = "🛑 " if s.id in warnings_dict else ""
                 assigned = (s.assigned_user_ids or "").split(",")
-                row = {"ID": s.id, "זמן": f"{err_mark}{s.start_time.strftime('%H:%M')}"}
+                # תוקן: מציג עכשיו טווח שעות מלא (התחלה - סיום)
+                row = {"ID": s.id, "זמן": f"{err_mark}{s.start_time.strftime('%H:%M')} - {s.end_time.strftime('%H:%M')}"}
                 for j in range(max_g):
                     row[f"שומר {j+1}"] = id_to_name.get(assigned[j] if j < len(assigned) else "", "-- פנוי --")
                 data.append(row)
@@ -297,7 +303,6 @@ def render_personnel_tab(db_session):
     col1, col2 = st.columns(2)
     with col1:
         with st.expander("➕ הוספת רשימת חיילים (Bulk Add)"):
-            # שימוש ב-form כדי לנקות נתונים לאחר השליחה
             with st.form("bulk_add_form", clear_on_submit=True):
                 bulk_text = st.text_area("הדבק שמות (מופרדים בפסיק או שורה חדשה):")
                 if st.form_submit_button("הוסף את כולם"):
@@ -312,7 +317,6 @@ def render_personnel_tab(db_session):
         with st.expander("🚫 הזנת אילוץ/חוסר זמינות"):
             all_users = db_session.query(User).all()
             if all_users:
-                # שימוש ב-form כדי לנקות נתונים
                 with st.form("add_constraint_form", clear_on_submit=True):
                     u_names = [u.name for u in all_users]
                     sel_user = st.selectbox("בחר חייל:", u_names)
@@ -340,7 +344,6 @@ def render_personnel_tab(db_session):
     
     summary = []
     for u in users:
-        # כאן אנחנו גם קוראים שעות מהמסד כדי לוודא שזה מדויק לתצוגה
         total_real_hours = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in shifts if str(u.id) in (s.assigned_user_ids or "").split(",")])
         row = {"ID": u.id, "שם": u.name, "סה\"כ שעות": round(total_real_hours, 1)}
         for p in posts:
@@ -362,7 +365,6 @@ def render_personnel_tab(db_session):
             db_session.commit()
             st.rerun()
 
-    # טבלת אילוצים פעילה
     constraints = db_session.query(Constraint).all()
     if constraints:
         with st.expander("📋 אילוצים רשומים במערכת"):
@@ -392,7 +394,6 @@ def render_settings_tab(db_session):
     st.header("הגדרות עמדות ותגבורים ⚙️")
     
     with st.expander("➕ הוספת עמדה חדשה", expanded=False):
-        # שימוש ב-form כדי לנקות נתונים לאחר השליחה
         with st.form("add_post_form", clear_on_submit=True):
             name = st.text_input("שם העמדה")
             c1, c2 = st.columns(2)
@@ -429,40 +430,4 @@ def render_settings_tab(db_session):
 
     st.divider()
     st.subheader("📅 ייצור סלוטים")
-    g_date = st.date_input("יום לייצור:", date.today())
-    if st.button("ייצר סלוטים ריקים לתאריך זה", type="primary"):
-        for p in posts:
-            curr = datetime.combine(g_date, time(0,0))
-            while curr < datetime.combine(g_date, time(0,0)) + timedelta(days=1):
-                if is_time_in_range(p.active_from, p.active_to, curr.time()):
-                    req = p.required_guards
-                    if p.boost_guards > 0 and is_time_in_range(p.boost_from, p.boost_to, curr.time()):
-                        req += p.boost_guards
-                    if not db_session.query(Shift).filter_by(post_id=p.id, start_time=curr).first():
-                        db_session.add(Shift(post_id=p.id, start_time=curr, 
-                                           end_time=curr + timedelta(minutes=p.shift_length_minutes),
-                                           required_count=req))
-                curr += timedelta(minutes=p.shift_length_minutes)
-        db_session.commit()
-        st.success("סלוטים נוצרו בהצלחה!")
-
-    st.markdown('<div class="danger-zone">', unsafe_allow_html=True)
-    if st.button("🗑️ מחיקת כל הסלוטים"):
-        db_session.query(Shift).delete()
-        db_session.commit()
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# ==========================================
-# 6. Main
-# ==========================================
-def main():
-    db_session = SessionLocal()
-    st.title("ניהול שמירות מילואים 🇮🇱")
-    t1, t2, t3 = st.tabs(["דשבורד 🛡️", "כוח אדם 👥", "הגדרות ⚙️"])
-    with t1: render_dashboard_tab(db_session)
-    with t2: render_personnel_tab(db_session)
-    with t3: render_settings_tab(db_session)
-    db_session.close()
-
-if __name__ == "__main__": main()
+    g
