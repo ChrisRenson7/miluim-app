@@ -31,8 +31,8 @@ st.markdown("""
     }
     
     div[data-testid="stCellInner"] {
-        text-align: center;
-        justify-content: center;
+        text-align: right !important;
+        justify-content: flex-start !important; /* flex-start with direction rtl means right */
     }
 
     .stButton>button { width: 100%; font-weight: bold; border-radius: 8px; }
@@ -317,7 +317,7 @@ def render_dashboard_tab(db_session):
             for j in range(max_g):
                 config[f"שומר {j+1}"] = st.column_config.SelectboxColumn(options=["-- פנוי --"] + list(name_to_id.keys()))
             
-            edited_df = st.data_editor(df.style.set_properties(**{'text-align': 'center'}), 
+            edited_df = st.data_editor(df.style.set_properties(**{'text-align': 'right'}), 
                                        column_config=config, hide_index=True, key=f"d_{post.id}_{selected_date}", use_container_width=True)
             
             for _, r in edited_df.iterrows():
@@ -397,7 +397,7 @@ def render_personnel_tab(db_session):
         st.subheader("📊 פירוט שעות שמירה")
         df_sum = pd.DataFrame(summary)
         df_sum = df_sum.iloc[:, ::-1] # היפוך עמודות
-        ed_p = st.data_editor(df_sum.style.set_properties(**{'text-align': 'center'}), hide_index=True, use_container_width=True)
+        ed_p = st.data_editor(df_sum.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
         
         if st.button("💾 שמור שינויים / מחק מסומנים"):
             for _, r in ed_p.iterrows():
@@ -416,7 +416,7 @@ def render_personnel_tab(db_session):
                 c_data.append({"ID": c.id, "חייל": u_n, "התחלה": c.start_time.strftime('%d/%m %H:%M'), "סיום": c.end_time.strftime('%d/%m %H:%M'), "סיבה": c.reason, "מחק": False})
             df_c = pd.DataFrame(c_data)
             df_c = df_c.iloc[:, ::-1] # היפוך עמודות
-            ed_c = st.data_editor(df_c, hide_index=True, use_container_width=True)
+            ed_c = st.data_editor(df_c.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
             if st.button("מחק אילוצים מסומנים"):
                 for _, r in ed_c.iterrows():
                     if r["מחק"]: db_session.delete(db_session.query(Constraint).get(r["ID"]))
@@ -465,7 +465,7 @@ def render_settings_tab(db_session):
         p_list = [{"ID": p.id, "שם": p.name, "משך": p.shift_length_minutes, "שומרים": p.required_guards, "למחיקה": False} for p in posts]
         df_p = pd.DataFrame(p_list)
         df_p = df_p.iloc[:, ::-1] # היפוך עמודות
-        ed_p = st.data_editor(df_p, hide_index=True, use_container_width=True)
+        ed_p = st.data_editor(df_p.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
         if st.button("מחק עמדות מסומנות"):
             for _, r in ed_p.iterrows():
                 if r["למחיקה"]: 
@@ -519,7 +519,7 @@ def render_settings_tab(db_session):
             
             df_r = pd.DataFrame(r_data)
             df_r = df_r.iloc[:, ::-1] # היפוך עמודות
-            ed_r = st.data_editor(df_r, hide_index=True, use_container_width=True)
+            ed_r = st.data_editor(df_r.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
             if st.button("מחק כללי זוגיות מסומנים"):
                 for _, row in ed_r.iterrows():
                     if row["למחיקה"]:
@@ -561,7 +561,7 @@ def render_settings_tab(db_session):
             
             df_pc = pd.DataFrame(pc_data)
             df_pc = df_pc.iloc[:, ::-1] # היפוך עמודות ל-RTL
-            ed_pc = st.data_editor(df_pc, hide_index=True, use_container_width=True)
+            ed_pc = st.data_editor(df_pc.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
             if st.button("מחק אילוצי עמדה מסומנים"):
                 for _, row in ed_pc.iterrows():
                     if row["למחיקה"]:
