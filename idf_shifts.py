@@ -160,6 +160,19 @@ def auto_assign_shifts(db_session, target_date):
     unassigned_shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).order_by(Shift.start_time).all()
     users = db_session.query(User).all()
     
+    # חישוב שעות דינאמי ומוודא עצמו מהמסד נתונים כדי שיתחשב גם בשינויים ידניים!
+    all_shifts = db_session.query(Shift).filter(Shift.assigned_user_ids != "").all()
+    user_stats = {str(u.id): {"total": 0.0, "daily": 0.0} for u in users}
+    
+    for s in all_shifts:
+        duration = (s.end_time - s.start_time).total_seconds() / 3600.0
+        is_today = start_dt <= s.start_time < end_dt
+        for uid in (s.assigned_user_ids or "").split(","):
+            if uid in user_stats:
+                user_stats[uid]["total"] += duration
+                if is_today:
+                    user_stats[uid]["daily"] += duration
+    
     for shift in unassigned_shifts:
         assigned_list = [x for x in (shift.assigned_user_ids or "").split(",") if x]
         needed = shift.required_count - len(assigned_list)
@@ -168,7 +181,8 @@ def auto_assign_shifts(db_session, target_date):
             db_session.flush()
             candidates = []
             for user in users:
-                if str(user.id) in assigned_list: continue
+                uid_str = str(user.id)
+                if uid_str in assigned_list: continue
                 
                 # פסילה על חפיפת זמנים
                 u_s = [s for s in db_session.query(Shift).filter(Shift.start_time >= start_dt - timedelta(hours=24)).all() if str(user.id) in (s.assigned_user_ids or "").split(",")]
@@ -179,15 +193,24 @@ def auto_assign_shifts(db_session, target_date):
 
                 last_s = max([s for s in u_s if s.end_time <= shift.start_time], key=lambda x: x.end_time, default=None)
                 rest = (shift.start_time - last_s.end_time).total_seconds() / 3600.0 if last_s else 999
-                same_post = 1 if last_s and last_s.post_id == shift.post_id else 0
                 
-                candidates.append({"user": user, "total": user.total_hours, "rest": rest, "same_post": same_post})
+                total_h = user_stats[uid_str]["total"]
+                daily_h = user_stats[uid_str]["daily"]
+                
+                candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest})
             
             if candidates:
-                candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, c["same_post"], c["total"], -c["rest"]))
+                # הוגנות: 1. מספיק מנוחה 2. מעט שעות *היום* 3. מעט שעות בכללי 4. נח הכי הרבה
+                candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, c["daily"], c["total"], -c["rest"]))
                 best = candidates[0]["user"]
-                assigned_list.append(str(best.id))
-                best.total_hours += (shift.end_time - shift.start_time).total_seconds() / 3600.0
+                best_uid = str(best.id)
+                
+                assigned_list.append(best_uid)
+                duration = (shift.end_time - shift.start_time).total_seconds() / 3600.0
+                
+                user_stats[best_uid]["total"] += duration
+                user_stats[best_uid]["daily"] += duration
+                best.total_hours += duration  # שמירה רק לגיבוי, בפועל אנו מסתמכים על user_stats
                 shift.assigned_user_ids = ",".join(assigned_list)
     db_session.commit()
 
@@ -274,34 +297,39 @@ def render_personnel_tab(db_session):
     col1, col2 = st.columns(2)
     with col1:
         with st.expander("➕ הוספת רשימת חיילים (Bulk Add)"):
-            bulk_text = st.text_area("הדבק שמות (מופרדים בפסיק או שורה חדשה):")
-            if st.button("הוסף את כולם"):
-                names = [n.strip() for n in bulk_text.replace(",", "\n").split("\n") if n.strip()]
-                for name in names:
-                    if not db_session.query(User).filter_by(name=name).first():
-                        db_session.add(User(name=name))
-                db_session.commit()
-                st.rerun()
+            # שימוש ב-form כדי לנקות נתונים לאחר השליחה
+            with st.form("bulk_add_form", clear_on_submit=True):
+                bulk_text = st.text_area("הדבק שמות (מופרדים בפסיק או שורה חדשה):")
+                if st.form_submit_button("הוסף את כולם"):
+                    names = [n.strip() for n in bulk_text.replace(",", "\n").split("\n") if n.strip()]
+                    for name in names:
+                        if not db_session.query(User).filter_by(name=name).first():
+                            db_session.add(User(name=name))
+                    db_session.commit()
+                    st.rerun()
 
     with col2:
         with st.expander("🚫 הזנת אילוץ/חוסר זמינות"):
             all_users = db_session.query(User).all()
             if all_users:
-                u_names = [u.name for u in all_users]
-                sel_user = st.selectbox("בחר חייל:", u_names)
-                c_date = st.date_input("בתאריך:", date.today())
-                c_col1, c_col2 = st.columns(2)
-                t_from = c_col1.time_input("משעה:", time(8, 0))
-                t_to = c_col2.time_input("עד שעה:", time(12, 0))
-                c_reason = st.text_input("סיבה (אופציונלי):", "אילוץ אישי")
-                
-                if st.button("שמור אילוץ"):
-                    uid = db_session.query(User.id).filter_by(name=sel_user).scalar()
-                    start_c = datetime.combine(c_date, t_from)
-                    end_c = datetime.combine(c_date, t_to)
-                    db_session.add(Constraint(user_id=uid, start_time=start_c, end_time=end_c, reason=c_reason))
-                    db_session.commit()
-                    st.success(f"האילוץ ל{sel_user} נשמר.")
+                # שימוש ב-form כדי לנקות נתונים
+                with st.form("add_constraint_form", clear_on_submit=True):
+                    u_names = [u.name for u in all_users]
+                    sel_user = st.selectbox("בחר חייל:", u_names)
+                    c_date = st.date_input("בתאריך:", date.today())
+                    c_col1, c_col2 = st.columns(2)
+                    t_from = c_col1.time_input("משעה:", time(8, 0))
+                    t_to = c_col2.time_input("עד שעה:", time(12, 0))
+                    c_reason = st.text_input("סיבה (אופציונלי):", "אילוץ אישי")
+                    
+                    if st.form_submit_button("שמור אילוץ"):
+                        uid = db_session.query(User.id).filter_by(name=sel_user).scalar()
+                        start_c = datetime.combine(c_date, t_from)
+                        end_c = datetime.combine(c_date, t_to)
+                        db_session.add(Constraint(user_id=uid, start_time=start_c, end_time=end_c, reason=c_reason))
+                        db_session.commit()
+                        st.toast(f"האילוץ ל{sel_user} נשמר בהצלחה.")
+                        st.rerun()
             else:
                 st.warning("הוסף קודם חיילים למערכת.")
 
@@ -312,7 +340,9 @@ def render_personnel_tab(db_session):
     
     summary = []
     for u in users:
-        row = {"ID": u.id, "שם": u.name, "סה\"כ שעות": round(u.total_hours, 1)}
+        # כאן אנחנו גם קוראים שעות מהמסד כדי לוודא שזה מדויק לתצוגה
+        total_real_hours = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in shifts if str(u.id) in (s.assigned_user_ids or "").split(",")])
+        row = {"ID": u.id, "שם": u.name, "סה\"כ שעות": round(total_real_hours, 1)}
         for p in posts:
             p_hrs = sum([(s.end_time - s.start_time).total_seconds()/3600 for s in shifts if s.post_id == p.id and str(u.id) in (s.assigned_user_ids or "").split(",")])
             row[f"שעות ב-{p.name}"] = round(p_hrs, 1)
@@ -362,7 +392,8 @@ def render_settings_tab(db_session):
     st.header("הגדרות עמדות ותגבורים ⚙️")
     
     with st.expander("➕ הוספת עמדה חדשה", expanded=False):
-        with st.form("add_post"):
+        # שימוש ב-form כדי לנקות נתונים לאחר השליחה
+        with st.form("add_post_form", clear_on_submit=True):
             name = st.text_input("שם העמדה")
             c1, c2 = st.columns(2)
             s_len = c1.number_input("אורך משמרת (דקות)", 120)
