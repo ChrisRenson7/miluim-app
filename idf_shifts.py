@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, 
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ==========================================
-# 0. הגדרות תצוגה ו-RTL
+# 0. הגדרות תצוגה ו-RTL (ללא Wide Mode!)
 # ==========================================
 st.set_page_config(page_title="מערכת שיבוץ - מילואים", layout="centered")
 
@@ -22,14 +22,6 @@ st.markdown("""
     h1, h2, h3, h4, h5, h6, p, label, .stMarkdown, .stSelectbox, .stTextInput, .stNumberInput, .stTimeInput, .stDateInput {
         direction: rtl;
         text-align: right;
-    }
-
-    /* רוחב דינאמי עד 98% מהמסך בעת הצורך כדי למנוע סקרול רוחבי, אבל לא Wide שובר מסך */
-    .block-container {
-        max-width: 98% !important;
-        width: 100% !important;
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
     }
 
     /* יישור טבלאות RTL ומרכוז תוכן */
@@ -54,6 +46,33 @@ st.markdown("""
 
     .stButton>button { width: 100%; font-weight: bold; border-radius: 8px; }
     
+    /* עיצוב כפתורים: כפתור Primary ירוק/חי במקום אדום */
+    button[kind="primary"] {
+        background-color: #059669 !important; /* ירוק אמרלד */
+        border-color: #059669 !important;
+        color: white !important;
+    }
+    button[kind="primary"]:hover {
+        background-color: #047857 !important;
+        border-color: #047857 !important;
+    }
+
+    /* כפתור נקה לוח - כחול/אפור כהה */
+    button[kind="secondary"] {
+        border-color: #d1d5db !important;
+    }
+
+    /* אזור סכנה ומחיקות נשאר באדום מובהק */
+    .danger-zone button {
+        background-color: #dc2626 !important;
+        border-color: #dc2626 !important;
+        color: white !important;
+    }
+    .danger-zone button:hover {
+        background-color: #b91c1c !important;
+        border-color: #b91c1c !important;
+    }
+
     .post-header { 
         text-align: center; 
         padding: 12px; 
@@ -96,7 +115,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     total_hours = Column(Float, default=0.0)
-    is_commander = Column(Boolean, default=False) # תוספת חכמה למפקד
+    is_commander = Column(Boolean, default=False) 
 
 class Post(Base):
     __tablename__ = 'posts'
@@ -109,7 +128,7 @@ class Post(Base):
     boost_from = Column(Time, nullable=True)
     boost_to = Column(Time, nullable=True)
     boost_guards = Column(Integer, default=0)
-    requires_commander = Column(Boolean, default=False) # תוספת חובה למפקד
+    requires_commander = Column(Boolean, default=False) 
 
 class Shift(Base):
     __tablename__ = 'shifts'
@@ -149,7 +168,6 @@ class SystemSetting(Base):
 engine = create_engine('sqlite:///shifts_v8.db', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
 
-# מיגרציה שקטה: מוסיף עמודות חדשות למסד נתונים קיים מבלי למחוק מידע!
 with engine.connect() as conn:
     try: conn.execute(text("ALTER TABLE users ADD COLUMN is_commander BOOLEAN DEFAULT 0"))
     except: pass
@@ -169,9 +187,9 @@ def is_time_in_range(start, end, current):
         return start <= current <= end
     return current >= start or current <= end
 
-def get_shift_warnings(db_session, target_date):
+def get_shift_warnings(db_session, target_date, days_to_add=1):
     start_dt = datetime.combine(target_date, time(0,0))
-    end_dt = start_dt + timedelta(days=2) # 48 שעות!
+    end_dt = start_dt + timedelta(days=days_to_add) 
     shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).all()
     warnings = {}
     posts_cache = {p.id: p for p in db_session.query(Post).all()}
@@ -184,7 +202,6 @@ def get_shift_warnings(db_session, target_date):
         if len(assigned_ids) < s.required_count:
             warnings[s.id] = f"בעמדת {post_obj.name if post_obj else s.post_id}: חסר שומר ({len(assigned_ids)}/{s.required_count})"
         
-        # התרעת חוסר מפקד בעמדה
         if post_obj and post_obj.requires_commander and assigned_ids:
             has_cmd = any(users_cache[uid].is_commander for uid in assigned_ids if uid in users_cache)
             if not has_cmd:
@@ -216,9 +233,9 @@ def get_shift_warnings(db_session, target_date):
                     warnings[s.id] = f"חריגת מנוחה ל{u_name}: שמר קודם ב{prev_post_name} ({s_time}-{e_time}). נח {rest:.1f} ש' (אילוץ)."
     return warnings
 
-def auto_assign_shifts(db_session, target_date):
+def auto_assign_shifts(db_session, target_date, days_to_add=1):
     start_dt = datetime.combine(target_date, time(0,0))
-    end_dt = start_dt + timedelta(days=2) # שיבוץ רץ על טווח ה-48 שעות המוצג!
+    end_dt = start_dt + timedelta(days=days_to_add) 
     unassigned_shifts = db_session.query(Shift).filter(Shift.start_time >= start_dt, Shift.start_time < end_dt).order_by(Shift.start_time).all()
     users = db_session.query(User).all()
     posts = {p.id: p for p in db_session.query(Post).all()}
@@ -281,19 +298,17 @@ def auto_assign_shifts(db_session, target_date):
                 total_h = user_stats[uid_str]["total"]
                 daily_h = user_stats[uid_str]["daily"]
                 
-                # תעדוף עליון למפקד אם העמדה דורשת ועוד אין מפקד
                 cmd_priority = 1 if (req_cmd and not has_cmd and user.is_commander) else 0
                 
                 candidates.append({"user": user, "total": total_h, "daily": daily_h, "rest": rest, "buddy_score": buddy_score, "cmd_priority": cmd_priority})
             
             if candidates:
-                # מיון: קודם מנוחה -> מפקד מקבל עדיפות מוחלטת לעמדת חובה -> זוגיות חמ"ד -> הוגנות שעות
                 candidates.sort(key=lambda c: (c["rest"] < MIN_REST_HOURS, -c["cmd_priority"], -c["buddy_score"], c["daily"], c["total"], -c["rest"]))
                 best = candidates[0]["user"]
                 best_uid = str(best.id)
                 
                 assigned_list.append(best_uid)
-                if best.is_commander: has_cmd = True # עדכון זמינות מפקד לעמדה זו
+                if best.is_commander: has_cmd = True 
                 
                 duration = (shift.end_time - shift.start_time).total_seconds() / 3600.0
                 user_stats[best_uid]["total"] += duration
@@ -306,25 +321,26 @@ def auto_assign_shifts(db_session, target_date):
 # 3. טאב דשבורד
 # ==========================================
 def render_dashboard_tab(db_session):
-    st.header("לוח שיבוצים מרכזי (48 שעות) 🛡️")
+    st.header("לוח שיבוצים מרכזי 🛡️")
     
-    # -------- סרגל כלים (Toolbar) ידידותי --------
     tools_container = st.container()
     with tools_container:
-        col_date, col_auto, col_clear, col_save = st.columns([1.5, 1, 1, 1])
+        col_date, col_auto, col_clear, col_save = st.columns([1.5, 1.2, 1, 1])
         with col_date:
             selected_date = st.date_input("תאריך התחלה:", date.today())
+            view_mode = st.radio("תצוגת לוח:", ["24 שעות", "48 שעות"], horizontal=True, label_visibility="collapsed")
+            days_to_show = 1 if view_mode == "24 שעות" else 2
         with col_auto:
             st.write("") 
             if st.button("🤖 שיבוץ אוטומטי חכם", type="primary", use_container_width=True):
-                auto_assign_shifts(db_session, selected_date)
+                auto_assign_shifts(db_session, selected_date, days_to_show)
                 st.success("השיבוץ הושלם!")
                 st.rerun()
         with col_clear:
             st.write("") 
             if st.button("🧹 נקה לוח ידנית", use_container_width=True):
                 s_clear = datetime.combine(selected_date, time(0,0))
-                e_clear = s_clear + timedelta(days=2)
+                e_clear = s_clear + timedelta(days=days_to_show)
                 shifts_to_clear = db_session.query(Shift).filter(Shift.start_time >= s_clear, Shift.start_time < e_clear).all()
                 for s in shifts_to_clear:
                     s.assigned_user_ids = ""
@@ -334,18 +350,16 @@ def render_dashboard_tab(db_session):
         with col_save:
             st.write("") 
             if st.button("💾 שמור שינויים ידניים", type="primary", use_container_width=True):
-                db_session.commit()
+                # השמירה עכשיו מתבצעת אוטומטית למטה, הכפתור הזה רק משדר הצלחה ומרענן!
                 st.success("השינויים הידניים נשמרו בהצלחה!")
                 st.rerun()
     st.divider()
-    # ---------------------------------------------
 
     time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
     time_format_full = True if not time_setting or time_setting.value == "full" else False
 
     users = db_session.query(User).all()
     posts = db_session.query(Post).all()
-    # הוספת כוכב למפקדים
     id_to_name = {str(u.id): f"{u.name} ⭐" if u.is_commander else u.name for u in users}
     name_to_id = {f"{u.name} ⭐" if u.is_commander else u.name: str(u.id) for u in users}
     
@@ -354,9 +368,9 @@ def render_dashboard_tab(db_session):
         return
 
     start_view = datetime.combine(selected_date, time(0,0))
-    end_view = start_view + timedelta(days=2) # הצגת 48 שעות
+    end_view = start_view + timedelta(days=days_to_show) 
     
-    warnings_dict = get_shift_warnings(db_session, selected_date)
+    warnings_dict = get_shift_warnings(db_session, selected_date, days_to_show)
     post_cols = st.columns(len(posts))
     
     for i, post in enumerate(posts):
@@ -365,7 +379,7 @@ def render_dashboard_tab(db_session):
             p_shifts = db_session.query(Shift).filter(Shift.post_id == post.id, Shift.start_time >= start_view, Shift.start_time < end_view).order_by(Shift.start_time).all()
             
             if not p_shifts:
-                st.caption("אין משמרות ב-48 השעות הקרובות.")
+                st.caption("אין משמרות בטווח הזמן הזה.")
                 continue
 
             data = []
@@ -375,8 +389,7 @@ def render_dashboard_tab(db_session):
                 err_mark = "🛑 " if s.id in warnings_dict else ""
                 assigned = (s.assigned_user_ids or "").split(",")
                 
-                # עיצוב שעות עם תאריך כדי שיהיה ברור מתי חוצה לילה
-                s_f = s.start_time.strftime('%d/%m %H:%M')
+                s_f = s.start_time.strftime('%d/%m %H:%M') if days_to_show == 2 else s.start_time.strftime('%H:%M')
                 e_f = s.end_time.strftime('%H:%M')
                 t_str = f"{s_f} - {e_f}" if time_format_full else s_f
                 
@@ -394,10 +407,14 @@ def render_dashboard_tab(db_session):
             edited_df = st.data_editor(df.style.set_properties(**{'text-align': 'right'}), 
                                        column_config=config, hide_index=True, key=f"d_{post.id}_{selected_date}", use_container_width=True)
             
+            # --- התיקון הקריטי: שמירה אוטומטית בזמן אמת ---
             for _, r in edited_df.iterrows():
                 s_obj = db_session.query(Shift).get(r["ID"])
                 u_names = [r[f"שומר {j+1}"] for j in range(max_g) if f"שומר {j+1}" in r and r[f"שומר {j+1}"] != "-- פנוי --"]
-                s_obj.assigned_user_ids = ",".join([name_to_id[n] for n in u_names if n in name_to_id])
+                new_assigned = ",".join([name_to_id[n] for n in u_names if n in name_to_id])
+                if s_obj.assigned_user_ids != new_assigned:
+                    s_obj.assigned_user_ids = new_assigned
+                    db_session.commit() # שומר מיד ברגע שעורכים משהו!
 
     if warnings_dict:
         st.markdown('<div class="alert-box"><strong>🚨 חריגות בלוח:</strong><br/>' + 
@@ -407,10 +424,13 @@ def render_dashboard_tab(db_session):
 # 3.5. טאב תצוגה לצילום מסך (View Only)
 # ==========================================
 def render_screenshot_tab(db_session):
-    st.header("📸 תצוגה ל-48 שעות לצילום מסך")
+    st.header("📸 תצוגה נקייה לצילום מסך")
     st.caption("הטבלאות חסומות לעריכה. מיושרות היטב לצילום מסך ושליחה בקבוצה.")
     
-    selected_date = st.date_input("תאריך התחלה:", date.today(), key="screenshot_date")
+    col1, col2 = st.columns(2)
+    selected_date = col1.date_input("תאריך התחלה:", date.today(), key="screenshot_date")
+    view_mode = col2.radio("תצוגת לוח:", ["24 שעות", "48 שעות"], horizontal=True, key="screen_radio")
+    days_to_show = 1 if view_mode == "24 שעות" else 2
     
     time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
     time_format_full = True if not time_setting or time_setting.value == "full" else False
@@ -424,7 +444,7 @@ def render_screenshot_tab(db_session):
         return
 
     start_view = datetime.combine(selected_date, time(0,0))
-    end_view = start_view + timedelta(days=2) # 48 שעות
+    end_view = start_view + timedelta(days=days_to_show)
     
     post_cols = st.columns(len(posts))
     
@@ -442,7 +462,7 @@ def render_screenshot_tab(db_session):
             
             for s in p_shifts:
                 assigned = (s.assigned_user_ids or "").split(",")
-                s_f = s.start_time.strftime('%d/%m %H:%M')
+                s_f = s.start_time.strftime('%d/%m %H:%M') if days_to_show == 2 else s.start_time.strftime('%H:%M')
                 e_f = s.end_time.strftime('%H:%M')
                 t_str = f"{s_f} - {e_f}" if time_format_full else s_f
                 
@@ -517,12 +537,17 @@ def render_personnel_tab(db_session):
         summary.append(row)
     
     if summary:
-        st.subheader("📊 ניהול סד\"כ (סמן מפקדים למשמרות מעורבות)")
+        # --- תוספת אנליטיקה וגרפים ---
+        st.subheader("📊 אנליטיקת חלוקת נטל ושעות")
+        chart_data = pd.DataFrame(summary).set_index("שם")["סה\"כ שעות"]
+        st.bar_chart(chart_data, color="#059669")
+        
+        st.subheader("📋 ניהול סד\"כ קבוע")
         df_sum = pd.DataFrame(summary)
         df_sum = df_sum.iloc[:, ::-1] 
         ed_p = st.data_editor(df_sum.style.set_properties(**{'text-align': 'right'}), hide_index=True, use_container_width=True)
         
-        if st.button("💾 שמור שינויים / מחק מסומנים"):
+        if st.button("💾 שמור שינויים בכוח אדם", type="primary"):
             for _, r in ed_p.iterrows():
                 u_obj = db_session.query(User).get(r["ID"])
                 if r["למחיקה"]: 
@@ -552,25 +577,23 @@ def render_personnel_tab(db_session):
 
     st.markdown('<div class="danger-zone">', unsafe_allow_html=True)
     st.subheader("⚠️ אזור סכנה")
-    if st.button("🔄 איפוס מונה שעות לכולם"):
+    if st.button("🔄 איפוס מונה שעות לכולם (לחיצה אדומה)"):
         for u in users: u.total_hours = 0
         db_session.commit()
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================
-# 5. טאב הגדרות (משופץ עם Sub-Tabs)
+# 5. טאב הגדרות
 # ==========================================
 def render_settings_tab(db_session):
     st.header("הגדרות מערכת ⚙️")
     
-    # פיצול לכרטיסיות פנימיות לממשק נקי יותר
     tab_posts, tab_rules, tab_sys = st.tabs(["🏗️ ניהול ועריכת עמדות", "⚖️ זוגיות וחסימות", "🛠️ הגדרות כלליות"])
     
     users = db_session.query(User).all()
     posts = db_session.query(Post).all()
     
-    # --- כרטיסייה 1: ניהול עמדות ---
     with tab_posts:
         with st.expander("➕ הוספת עמדה חדשה", expanded=False):
             with st.form("add_post_form", clear_on_submit=True):
@@ -612,7 +635,6 @@ def render_settings_tab(db_session):
                 db_session.commit()
                 st.rerun()
 
-    # --- כרטיסייה 2: אילוצים וזוגיות ---
     with tab_rules:
         st.subheader("🤝 חמ\"ד / הפרדת כוחות")
         if len(users) >= 2:
@@ -710,7 +732,6 @@ def render_settings_tab(db_session):
                     db_session.commit()
                     st.rerun()
 
-    # --- כרטיסייה 3: הגדרות כלליות ---
     with tab_sys:
         st.subheader("תצוגת זמן בטבלאות")
         time_setting = db_session.query(SystemSetting).filter_by(key="time_display").first()
